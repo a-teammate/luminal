@@ -120,7 +120,14 @@ fn expr_to_mojo(expr: &Expression, dyn_map: &FxHashMap<char, usize>, z_replace: 
     for term in resolved.terms.read().iter() {
         match term {
             Term::Num(n) => stack.push(n.to_string()),
-            Term::Var(_) => stack.push(z_replace.to_string()),
+            // 'z' is the per-dim index var (MIter after serialization); any
+            // other surviving variable is a named dim that resolve_vars
+            // couldn't bind — emitting the loop index there would silently
+            // produce a wrong kernel, so fail loudly instead.
+            Term::Var(v) if *v == 'z' => stack.push(z_replace.to_string()),
+            Term::Var(v) => {
+                panic!("unresolved dim '{v}' in expression {expr:?} (dyn_map {dyn_map:?})")
+            }
             // NOTE: Pop order MUST match Expression::exec_stack:
             //   a = pop() (top), b = pop() (second), result = op(a, b)
             Term::Add => {
