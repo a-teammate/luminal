@@ -32,6 +32,10 @@ struct MojoBucket {
     input_map: FxHashMap<NodeIndex, NodeIndex>,
     output_map: FxHashMap<NodeIndex, NodeIndex>,
     input_nodes: FxHashSet<NodeIndex>,
+    /// LLIR output nodes of this bucket. The persistent arena keeps every
+    /// buffer resident, so nothing trims to this set anymore — kept for
+    /// introspection and to consume `CodegenResult::output_nodes`.
+    #[allow(dead_code)]
     output_nodes: FxHashSet<NodeIndex>,
     representative_dyn_map: FxHashMap<char, usize>,
 }
@@ -42,8 +46,12 @@ pub struct MojoRuntime {
     dim_buckets: FxHashMap<char, Vec<DimBucket>>,
     active_bucket: usize,
 
-    /// LLIR buffers for the active bucket
-    pub buffers: FxHashMap<NodeIndex, Vec<u8>>,
+    /// LLIR buffer arena, partitioned per bucket (parallel to `buckets`).
+    /// Buffers persist across bucket switches and executes: existing buffers
+    /// are reused and only grown when a node needs more space, never cleared.
+    /// NodeIndex spaces are per-bucket, so partitioning by bucket is what
+    /// keeps same-index nodes of different buckets from aliasing.
+    pub buffers: Vec<FxHashMap<NodeIndex, Vec<u8>>>,
 
     /// HLIR-level persistent data (weights, KV cache, token IDs).
     /// Keyed by HLIR NodeIndex so it survives bucket switches.
@@ -56,8 +64,8 @@ pub struct MojoRuntime {
     /// Dyn map captured during filter_llir_candidate
     captured_dyn_map: FxHashMap<char, usize>,
 
-    /// Actual data size (in f32 elements) per LLIR node
-    data_len: FxHashMap<NodeIndex, usize>,
+    /// Actual data size (in f32 elements) per LLIR node, per bucket
+    data_len: Vec<FxHashMap<NodeIndex, usize>>,
 }
 
 impl Default for MojoRuntime {
@@ -66,12 +74,12 @@ impl Default for MojoRuntime {
             buckets: Vec::new(),
             dim_buckets: FxHashMap::default(),
             active_bucket: 0,
-            buffers: FxHashMap::default(),
+            buffers: Vec::new(),
             hlir_data: FxHashMap::default(),
             dirty: FxHashSet::default(),
             pending_inputs: FxHashMap::default(),
             captured_dyn_map: FxHashMap::default(),
-            data_len: FxHashMap::default(),
+            data_len: Vec::new(),
         }
     }
 }
@@ -112,8 +120,8 @@ impl MojoRuntime {
             .and_then(|b| b.output_map.get(&id).or_else(|| b.input_map.get(&id)))
             .copied();
         if let Some(llir) = llir_node {
-            self.data_len.remove(&llir);
-            self.buffers.remove(&llir).unwrap_or_default()
+            self.data_len[self.active_bucket].remove(&llir);
+            self.buffers[self.active_bucket].remove(&llir).unwrap_or_default()
         } else {
             self.hlir_data.remove(&id).unwrap_or_default()
         }
@@ -183,9 +191,14 @@ impl MojoRuntime {
             .copied()
             .unwrap_or(hlir_node);
         let empty: Vec<u8> = Vec::new();
-        let bytes = self.buffers.get(&llir_node).unwrap_or(&empty);
+        let bytes = self.buffers.get(self.active_bucket)
+            .and_then(|m| m.get(&llir_node))
+            .unwrap_or(&empty);
         let all_f32: &[f32] = bytemuck::cast_slice(bytes);
-        let len = self.data_len.get(&llir_node).copied().unwrap_or(all_f32.len());
+        let len = self.data_len.get(self.active_bucket)
+            .and_then(|m| m.get(&llir_node))
+            .copied()
+            .unwrap_or(all_f32.len());
         all_f32[..len.min(all_f32.len())].to_vec()
     }
 
@@ -194,18 +207,40 @@ impl MojoRuntime {
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
-    /// Compile Mojo source to a shared library and load it.
+    /// Compile Mojo source to a shared library and load it, backed by a
+    /// content-addressed cache under `<temp>/luminal_mojo_cache`:
+    /// `<FxHash(source)>.mojo` (always written, debugging aid) and
+    /// `<FxHash(source)>.so`. A cache hit skips `pixi run mojo build`
+    /// entirely and loads the cached library; a corrupt/stale entry is
+    /// removed and rebuilt once.
     fn compile_and_load(mojo_source: &str) -> Library {
+        use std::hash::{Hash, Hasher};
+
+        let cache_dir = std::env::temp_dir().join("luminal_mojo_cache");
+        let mut hasher = rustc_hash::FxHasher::default();
+        mojo_source.hash(&mut hasher);
+        let key = format!("{:016x}", hasher.finish());
+        let source_path = cache_dir.join(format!("{key}.mojo"));
+        let lib_path = cache_dir.join(format!("{key}.so"));
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        std::fs::write(&source_path, mojo_source)
+            .unwrap_or_else(|e| panic!("Failed to write Mojo source: {e}"));
+
+        if lib_path.exists() {
+            if let Ok(lib) = unsafe { Library::new(&lib_path) } {
+                return lib;
+            }
+            // Stale/corrupt cache entry: drop it and rebuild once below.
+            let _ = std::fs::remove_file(&lib_path);
+        }
+
         let tmp_dir = std::env::temp_dir();
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let source_path = tmp_dir.join(format!("luminal_mojo_{id}.mojo"));
-        let lib_path = tmp_dir.join(format!("luminal_mojo_{id}.so"));
-
-        std::fs::write(&source_path, mojo_source)
-            .unwrap_or_else(|e| panic!("Failed to write Mojo source: {e}"));
+        let lib_path_tmp = tmp_dir.join(format!("luminal_mojo_{id}.so"));
 
         let output = Command::new("pixi")
             .arg("run")
@@ -214,7 +249,7 @@ impl MojoRuntime {
             .arg("--emit")
             .arg("shared-lib")
             .arg("-o")
-            .arg(&lib_path)
+            .arg(&lib_path_tmp)
             .arg(&source_path)
             .output()
             .unwrap_or_else(|e| panic!("Failed to invoke mojo build: {e}"));
@@ -226,6 +261,9 @@ impl MojoRuntime {
                 "mojo build failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- source ---\n{mojo_source}"
             );
         }
+
+        std::fs::copy(&lib_path_tmp, &lib_path)
+            .unwrap_or_else(|e| panic!("Failed to persist built library to {lib_path:?}: {e}"));
 
         unsafe {
             Library::new(&lib_path)
@@ -273,13 +311,13 @@ impl MojoRuntime {
     }
 
     /// Switch to a different bucket: save output buffers to hlir_data,
-    /// allocate fresh buffers for the new bucket, load hlir_data.
+    /// (re)populate the new bucket's arena partition, load hlir_data.
     fn switch_bucket(&mut self, new_bucket: usize) {
         // Save current output buffers back to hlir_data
-        let old = &self.buckets[self.active_bucket];
-        for (&hlir, &llir) in &old.output_map {
-            if let Some(buf) = self.buffers.get(&llir) {
-                let len = self.data_len.get(&llir).copied().unwrap_or(buf.len() / 4);
+        let old = self.active_bucket;
+        for (&hlir, &llir) in &self.buckets[old].output_map {
+            if let Some(buf) = self.buffers[old].get(&llir) {
+                let len = self.data_len[old].get(&llir).copied().unwrap_or(buf.len() / 4);
                 let byte_len = (len * 4).min(buf.len());
                 self.hlir_data.insert(hlir, buf[..byte_len].to_vec());
             }
@@ -290,40 +328,61 @@ impl MojoRuntime {
     }
 
     /// Allocate buffers for the active bucket from buffer_sizes + hlir_data.
+    /// The arena is persistent: buffers of other buckets stay resident, and
+    /// this bucket's existing buffers are reused (grown in place only when a
+    /// node needs more space). Fresh allocations are zero-initialised, so
+    /// first-entry behaviour is unchanged.
     fn allocate_bucket_buffers(&mut self) {
-        self.buffers.clear();
-        self.data_len.clear();
-
-        let bucket = &self.buckets[self.active_bucket];
+        let idx = self.active_bucket;
+        while self.buffers.len() <= idx {
+            self.buffers.push(FxHashMap::default());
+        }
+        while self.data_len.len() <= idx {
+            self.data_len.push(FxHashMap::default());
+        }
 
         // Intermediate buffers
-        for (&node, &size) in &bucket.buffer_sizes {
-            let elem_count = size / 4;
-            self.data_len.insert(node, elem_count);
-            self.buffers.insert(node, vec![0u8; size + SAFETY_PAD]);
+        for (&node, &size) in &self.buckets[idx].buffer_sizes {
+            let needed = size + SAFETY_PAD;
+            self.data_len[idx].insert(node, size / 4);
+            let buf = self.buffers[idx].entry(node).or_insert_with(|| vec![0u8; needed]);
+            if buf.len() < needed {
+                buf.resize(needed, 0);
+            }
         }
 
         // Input buffers from hlir_data (or pending_inputs)
-        for (&hlir_node, &llir_node) in &bucket.input_map {
+        for (&hlir_node, &llir_node) in &self.buckets[idx].input_map {
             if let Some(data) = self.hlir_data.get(&hlir_node).cloned()
                 .or_else(|| self.pending_inputs.get(&hlir_node).cloned())
             {
-                let elem_count = data.len() / 4;
-                self.data_len.insert(llir_node, elem_count);
-                let mut buf = data;
-                buf.resize(buf.len() + SAFETY_PAD, 0);
-                self.buffers.insert(llir_node, buf);
+                self.data_len[idx].insert(llir_node, data.len() / 4);
+                Self::write_input_buffer(&mut self.buffers[idx], llir_node, &data);
             }
         }
 
         // Allocate input nodes not covered by hlir_data
-        for &node in &bucket.input_nodes {
-            self.buffers.entry(node).or_insert_with(|| {
-                let size = bucket.buffer_sizes.get(&node).copied().unwrap_or(4);
-                self.data_len.entry(node).or_insert(size / 4);
-                vec![0u8; size + SAFETY_PAD]
-            });
+        for &node in &self.buckets[idx].input_nodes {
+            let size = self.buckets[idx].buffer_sizes.get(&node).copied().unwrap_or(4);
+            self.data_len[idx].entry(node).or_insert(size / 4);
+            let needed = size + SAFETY_PAD;
+            let buf = self.buffers[idx].entry(node).or_insert_with(|| vec![0u8; needed]);
+            if buf.len() < needed {
+                buf.resize(needed, 0);
+            }
         }
+    }
+
+    /// Ensure `bufs[node]` exists and is large enough for `data` plus the
+    /// SAFETY_PAD tail (growing in place if needed), then copy `data` into
+    /// the front of it. Preserves any extra capacity for reuse.
+    fn write_input_buffer(bufs: &mut FxHashMap<NodeIndex, Vec<u8>>, node: NodeIndex, data: &[u8]) {
+        let needed = data.len() + SAFETY_PAD;
+        let buf = bufs.entry(node).or_insert_with(|| vec![0u8; needed]);
+        if buf.len() < needed {
+            buf.resize(needed, 0);
+        }
+        buf[..data.len()].copy_from_slice(data);
     }
 
     /// Copy dirty hlir_data into active bucket's LLIR input buffers.
@@ -340,16 +399,13 @@ impl MojoRuntime {
             return;
         }
 
-        let bucket = &self.buckets[self.active_bucket];
+        let idx = self.active_bucket;
         let dirty = std::mem::take(&mut self.dirty);
         for hlir_node in dirty {
-            if let Some(data) = self.hlir_data.get(&hlir_node) {
-                if let Some(&llir_node) = bucket.input_map.get(&hlir_node) {
-                    let mut buf = data.clone();
-                    buf.resize(buf.len() + SAFETY_PAD, 0);
-                    let elem_count = data.len() / 4;
-                    self.data_len.insert(llir_node, elem_count);
-                    self.buffers.insert(llir_node, buf);
+            if let Some(&llir_node) = self.buckets[idx].input_map.get(&hlir_node) {
+                if let Some(data) = self.hlir_data.get(&hlir_node) {
+                    self.data_len[idx].insert(llir_node, data.len() / 4);
+                    Self::write_input_buffer(&mut self.buffers[idx], llir_node, data);
                 }
             }
         }
@@ -522,16 +578,16 @@ impl Runtime for MojoRuntime {
 
         self.buckets = vec![bucket];
         self.active_bucket = 0;
+        self.buffers.truncate(1);
+        self.data_len.truncate(1);
         self.allocate_bucket_buffers();
 
         // Flush remaining pending_inputs
         let pending = std::mem::take(&mut self.pending_inputs);
         for (hlir_node, data) in pending {
             if let Some(&llir_node) = self.buckets[0].input_map.get(&hlir_node) {
-                let mut buf = data;
-                self.data_len.insert(llir_node, buf.len() / 4);
-                buf.resize(buf.len() + SAFETY_PAD, 0);
-                self.buffers.insert(llir_node, buf);
+                self.data_len[0].insert(llir_node, data.len() / 4);
+                Self::write_input_buffer(&mut self.buffers[0], llir_node, &data);
             }
         }
     }
@@ -566,6 +622,8 @@ impl Runtime for MojoRuntime {
             });
         }
         self.active_bucket = 0;
+        self.buffers.truncate(self.buckets.len());
+        self.data_len.truncate(self.buckets.len());
         self.allocate_bucket_buffers();
     }
 
@@ -588,22 +646,20 @@ impl Runtime for MojoRuntime {
         // Sync dirty hlir_data → LLIR buffers
         self.sync_dirty();
 
-        // Execute all steps from active bucket
+        // Execute all steps from the active bucket against its arena
+        // partition. Field-disjoint borrows let the plan/library stay in
+        // `self.buckets` while buffers/data_len are borrowed mutably — no
+        // per-execute plan clone. The arena is NOT trimmed after execution:
+        // buffers stay resident for the next execute/bucket re-entry.
         let active = self.active_bucket;
-        let bucket = &self.buckets[active];
-        let lib = &bucket.lib;
-        let exec_plan = &bucket.exec_plan;
-        let output_nodes = bucket.output_nodes.clone();
-
-        // We need to borrow buffers/data_len mutably but bucket immutably,
-        // so clone the plan references and use the free function.
-        let plan: Vec<ExecStep> = exec_plan.clone();
-        for step in &plan {
-            execute_step(step, lib, &mut self.buffers, &mut self.data_len);
+        for step in &self.buckets[active].exec_plan {
+            execute_step(
+                step,
+                &self.buckets[active].lib,
+                &mut self.buffers[active],
+                &mut self.data_len[active],
+            );
         }
-
-        // Retain only output buffers
-        self.buffers.retain(|k, _| output_nodes.contains(k));
     }
 
     fn profile(
