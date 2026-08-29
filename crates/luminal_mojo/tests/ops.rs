@@ -401,3 +401,57 @@ fn softmax_matches_reference() {
         "softmax",
     );
 }
+
+#[test]
+fn attention_scores_grouped_gqa_matches_reference() {
+    // GQA spelling: q heads outnumber kv heads; k is group-broadcast via
+    // expand_dim(1, groups).merge_dims(0, 1). The merged batch map contains
+    // an integer division, exercising the attention grouped-batch GEMM rule.
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let (seq, heads, hd, kv) = (6usize, 4usize, 8usize, 2usize);
+            let groups = heads / kv;
+            let q = cx.tensor((seq, heads * hd));
+            let k = cx.tensor((seq, kv * hd));
+            let q_3d = q.split_dims(1, hd).transpose(0, 1);
+            let k_3d = k.split_dims(1, hd).transpose(0, 1);
+            let k_exp = k_3d.expand_dim(1, groups).merge_dims(0, 1);
+            let out = q_3d.matmul(k_exp.transpose(1, 2)).output();
+            (
+                vec![
+                    (q.id, gen_data(seq * heads * hd, 1.0)),
+                    (k.id, gen_data(seq * kv * hd, 2.0)),
+                ],
+                out.id,
+            )
+        },
+        1e-4,
+        "attention scores (grouped GQA)",
+    );
+}
+
+#[test]
+fn attention_output_grouped_gqa_matches_reference() {
+    // Second attention GEMM: contiguous [heads, seq, seq] probs against the
+    // same grouped-broadcast v.
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let (seq, heads, hd, kv) = (6usize, 4usize, 8usize, 2usize);
+            let groups = heads / kv;
+            let probs = cx.tensor((heads, seq, seq));
+            let v = cx.tensor((seq, kv * hd));
+            let v_3d = v.split_dims(1, hd).transpose(0, 1);
+            let v_exp = v_3d.expand_dim(1, groups).merge_dims(0, 1);
+            let out = probs.matmul(v_exp).output();
+            (
+                vec![
+                    (probs.id, gen_data(heads * seq * seq, 3.0)),
+                    (v.id, gen_data(seq * kv * hd, 4.0)),
+                ],
+                out.id,
+            )
+        },
+        1e-4,
+        "attention output (grouped GQA)",
+    );
+}

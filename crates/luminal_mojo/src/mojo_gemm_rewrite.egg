@@ -3,6 +3,14 @@
 ; but the kernel is row-major natively, so there is no column-major swap and
 ; no layout/order fields. RELU follows the frontend's maximum-lowering:
 ;   relu(x) = (x < 0) * 0 + (1 - (x < 0)) * x
+;
+; Enode signature: (MojoGemm m n k batch a_batch a_row b_batch b_k b_n bias act dt)
+; The five stride fields are the operand index maps the kernel uses:
+;   a[i] = a_batch(i_b) + a_row(i_m) + i_k          (A's k stride is always 1)
+;   b[i] = b_batch(i_b) + b_k(i_k) + b_n(i_n)       (B slice addressing)
+;   out is contiguous row-major [batch, m, n]
+; The 2d/3d canonical rules re-emit their matched canonical maps, so the
+; kernel addressing is always exactly what the rule matched.
 
 ; ── Seed canonical stride spellings ─────────────────────────────────────────
 ; HLIR serialization and constant folding leave arbitrary-but-equal spellings
@@ -91,7 +99,7 @@
         (mojo_gemm_base_dtype ?dt)
     )
     (
-        (let ?gemm (Op (MojoGemm ?m ?n ?k (MNum 1) "none" "none" ?dt)
+        (let ?gemm (Op (MojoGemm ?m ?n ?k (MNum 1) (MNum 0) (MMul (MIter) ?k) (MNum 0) (MMul (MIter) ?n) (MIter) "none" "none" ?dt)
             (ICons ?a (ICons ?b (INil)))))
         (union ?sum ?gemm)
         (set (dtype ?gemm) ?dt)
@@ -133,7 +141,7 @@
         (mojo_gemm_base_dtype ?dt)
     )
     (
-        (let ?gemm (Op (MojoGemm ?m ?n ?k ?batch "none" "none" ?dt)
+        (let ?gemm (Op (MojoGemm ?m ?n ?k ?batch (MMul (MMul (MIter) ?k) ?m) (MMul (MIter) ?k) (MMul (MMul (MIter) ?k) ?n) (MMul (MIter) ?n) (MIter) "none" "none" ?dt)
             (ICons ?a (ICons ?b (INil)))))
         (union ?sum ?gemm)
         (set (dtype ?gemm) ?dt)
@@ -142,11 +150,55 @@
     :name "mojo gemm 3d batched row-major"
 )
 
+; ── Attention: batched GEMM with strided A rows + grouped-broadcast B ───────
+; The GQA spelling k.expand_dim(1, groups).merge_dims(0, 1) gives B a batch
+; map (i_b / groups) * stride (MDiv — non-affine, so the canonical 3d rule
+; can't match). A's row stride is arbitrary (q_3d's transpose: heads*hd).
+; Matches q_3d @ k_exp^T (B k-contig), softmax @ v_exp (B n-contig) and the
+; plain contiguous spelling. The operand maps are captured opaquely and
+; re-emitted verbatim, so the kernel addressing is always what was matched:
+;   A [b,m,k]: [a_batch, a_row, 0, 1]      (a_batch = hd for q_3d, m*k contig)
+;   B [b,n,k]: [b_batch, 0, b_n, b_k]      (b_batch = (i_b/g)*hd grouped)
+
+(rule
+    (
+        (= ?mul (Op (Mul
+            (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+            (ECons ?a_bs (ECons ?a_rs (ECons (MNum 0) (ECons (MIter) (ENil)))))
+            (ECons ?b_bs (ECons (MNum 0) (ECons ?b_ns (ECons ?b_ks (ENil)))))
+            (ECons (MMul (MMul (MMul (MIter) ?k) ?n) ?m) (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ECons (MIter) (ENil))))))
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?k
+            (ECons (MMul (MMul (MMul (MIter) ?k) ?n) ?m) (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ENil))))
+            (MIter)
+            (ECons (MMul (MMul (MIter) ?n) ?m) (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))))
+            (ICons ?mul (INil))))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (= ?dt (dtype ?sum))
+        (mojo_gemm_base_dtype ?dt)
+    )
+    (
+        (let ?gemm (Op (MojoGemm ?m ?n ?k ?batch ?a_bs ?a_rs ?b_bs ?b_ks ?b_ns "none" "none" ?dt)
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?gemm)
+        (set (dtype ?gemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm attention grouped-batch 3d"
+)
+
 ; ── Bias epilogue: add(gemm_out, bias[n] broadcast over rows) ───────────────
 
 (rule
     (
-        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch "none" ?act ?dt)
+        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch ?a_b ?a_r ?b_b ?b_k ?b_n "none" ?act ?dt)
             (ICons ?a (ICons ?b (INil)))))
         (= ?add (Op (Add
             (ECons ?m (ECons ?n (ENil)))
@@ -157,7 +209,7 @@
         (= (dtype ?bias) ?dt)
     )
     (
-        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch "bias" ?act ?dt)
+        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch ?a_b ?a_r ?b_b ?b_k ?b_n "bias" ?act ?dt)
             (ICons ?a (ICons ?b (ICons ?bias (INil))))))
         (union ?add ?fused)
         (set (dtype ?fused) ?dt)
@@ -170,7 +222,7 @@
 
 (rule
     (
-        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch ?bias "none" ?dt)
+        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch ?a_b ?a_r ?b_b ?b_k ?b_n ?bias "none" ?dt)
             (ICons ?a (ICons ?b ?gemm_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -200,7 +252,7 @@
         (= ?dt (dtype ?relu))
     )
     (
-        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch ?bias "relu" ?dt)
+        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch ?a_b ?a_r ?b_b ?b_k ?b_n ?bias "relu" ?dt)
             (ICons ?a (ICons ?b ?gemm_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) ?dt)

@@ -25,6 +25,16 @@ pub struct MojoGemmLLIR {
     pub n: Expression,
     pub k: Expression,
     pub batch: Expression,
+    /// A's batch-dim index map (over the batch index).
+    pub a_batch: Expression,
+    /// A's row (m) index map.
+    pub a_row: Expression,
+    /// B's batch-dim index map (may contain the GQA group div: (z/g)*stride).
+    pub b_batch: Expression,
+    /// B's k index map.
+    pub b_k: Expression,
+    /// B's n index map.
+    pub b_n: Expression,
     pub bias: bool,
     pub relu: bool,
     pub dtype: DType,
@@ -51,6 +61,11 @@ impl EgglogOp for MojoGemm {
                 ("n", EXPRESSION),
                 ("k", EXPRESSION),
                 ("batch", EXPRESSION),
+                ("a_batch", EXPRESSION),
+                ("a_row", EXPRESSION),
+                ("b_batch", EXPRESSION),
+                ("b_k", EXPRESSION),
+                ("b_n", EXPRESSION),
                 ("bias", STRING),
                 ("act", STRING),
                 ("dtype", DTYPE),
@@ -88,15 +103,25 @@ impl EgglogOp for MojoGemm {
         let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
         let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
         let batch = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-        let bias = egraph.enodes[kind_children[4]].0.trim_matches('"') == "bias";
-        let relu = egraph.enodes[kind_children[5]].0.trim_matches('"') == "relu";
-        let dtype = extract_dtype(egraph, kind_children[6]);
+        let a_batch = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
+        let a_row = extract_expr(egraph, kind_children[5], expr_cache).unwrap();
+        let b_batch = extract_expr(egraph, kind_children[6], expr_cache).unwrap();
+        let b_k = extract_expr(egraph, kind_children[7], expr_cache).unwrap();
+        let b_n = extract_expr(egraph, kind_children[8], expr_cache).unwrap();
+        let bias = egraph.enodes[kind_children[9]].0.trim_matches('"') == "bias";
+        let relu = egraph.enodes[kind_children[10]].0.trim_matches('"') == "relu";
+        let dtype = extract_dtype(egraph, kind_children[11]);
 
         let extracted = MojoGemmLLIR {
             m,
             n,
             k,
             batch,
+            a_batch,
+            a_row,
+            b_batch,
+            b_k,
+            b_n,
             bias,
             relu,
             dtype,

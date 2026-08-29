@@ -218,6 +218,14 @@ pub fn generate_mojo(
                 let n = resolve_expr(&gemm.n, dyn_map);
                 let k = resolve_expr(&gemm.k, dyn_map);
                 let batch = resolve_expr(&gemm.batch, dyn_map);
+                // Operand index maps → Mojo expressions over the loop vars.
+                // A is addressed as a_batch(ib) + a_row(im) + ik (k stride 1);
+                // B as b_batch(ib) + b_k(ik) + b_n(jn); out stays contiguous.
+                let a_batch = expr_to_mojo(&gemm.a_batch, dyn_map, "ib");
+                let a_row = expr_to_mojo(&gemm.a_row, dyn_map, "im");
+                let b_batch = expr_to_mojo(&gemm.b_batch, dyn_map, "ib");
+                let b_k = expr_to_mojo(&gemm.b_k, dyn_map, "ik");
+                let b_n = expr_to_mojo(&gemm.b_n, dyn_map, "jn");
                 let inputs: Vec<NodeIndex> = llir_graph
                     .edges_directed(node, Direction::Incoming)
                     .sorted_by_key(|e| e.id())
@@ -226,7 +234,10 @@ pub fn generate_mojo(
                 let bias = if gemm.bias { Some(inputs[2]) } else { None };
                 buffer_sizes.insert(node, batch * m * n * 4);
                 let fn_name = format!("op_{step_idx}");
-                mojo_funcs.push(gen_gemm(&fn_name, batch, m, n, k, gemm.bias, gemm.relu));
+                mojo_funcs.push(gen_gemm(
+                    &fn_name, batch, m, n, k, &a_batch, &a_row, &b_batch, &b_k, &b_n,
+                    gemm.bias, gemm.relu,
+                ));
                 exec_plan.push(ExecStep {
                     func_name: fn_name,
                     kind: StepKind::Gemm { a: inputs[0], b: inputs[1], bias, out: node },
@@ -795,7 +806,21 @@ def {fn_name}(
 /// Vectorized 8-wide along n (the only contiguous axis: b's rows and bias are
 /// contiguous in n) with a scalar tail for n % 8; `batch` is baked into the
 /// kernel body as an outermost loop, keeping the FFI signature pointer-only.
-fn gen_gemm(fn_name: &str, batch: usize, m: usize, n: usize, k: usize, bias: bool, relu: bool) -> String {
+#[allow(clippy::too_many_arguments)]
+fn gen_gemm(
+    fn_name: &str,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    a_batch: &str,
+    a_row: &str,
+    b_batch: &str,
+    b_k: &str,
+    b_n: &str,
+    bias: bool,
+    relu: bool,
+) -> String {
     let params = if bias {
         "a_ptr: OpaquePointer[MutUntrackedOrigin],\n    b_ptr: OpaquePointer[MutUntrackedOrigin],\n    bias_ptr: OpaquePointer[MutUntrackedOrigin],\n    out_ptr: OpaquePointer[MutUntrackedOrigin]"
     } else {
@@ -817,31 +842,80 @@ fn gen_gemm(fn_name: &str, batch: usize, m: usize, n: usize, k: usize, bias: boo
     let ik_body = if batched { "                    " } else { "                " };
     let epi = vec_body;
 
-    let a_batch = if batched { format!("ib * {} + ", m * k) } else { String::new() };
-    let b_batch = if batched { format!("ib * {} + ", k * n) } else { String::new() };
-    let batch_open = if batched {
-        format!("    for ib in range({batch}):\n")
-    } else {
-        String::new()
-    };
+    // Vectorization paths (B slices):
+    // - unit n stride → 8-wide along n (canonical + v_exp orientation)
+    // - unit k stride → 8-wide along k + reduce_add (kT orientation: the
+    //   transposed kv slice is k-contiguous)
+    // - otherwise → scalar
+    let vec_ok = b_n.trim() == "jn";
+    let kvec_ok = !vec_ok && b_k.trim() == "ik";
 
     let bias_vec = if bias {
         format!("{epi}acc8 = acc8 + bias.unsafe_load[width=8](jj)\n")
     } else {
         String::new()
     };
-    let relu_vec = if relu {
+    let relu_vec: String = if relu {
         format!("{epi}acc8 = max(acc8, SIMD[DType.float32, 8](0))\n")
     } else {
         String::new()
     };
-    let bias_scalar = if bias {
+    let bias_scalar: String = if bias {
         format!("{epi}acc = acc + bias.unsafe_load(jn)\n")
     } else {
         String::new()
     };
-    let relu_scalar = if relu {
+    let relu_scalar: String = if relu {
         format!("{epi}if acc < Float32(0):\n{epi}    acc = Float32(0)\n")
+    } else {
+        String::new()
+    };
+
+    // Inner accumulation loops.
+    let inner = if vec_ok {
+        format!(
+            "{loop2}var jj = 0
+{loop2}while jj + 8 <= {n}:
+{vec_body}var acc8 = SIMD[DType.float32, 8](0)
+{vec_body}for ik in range({k}):
+{ik_body}acc8 = acc8 + SIMD[DType.float32, 8](a.unsafe_load({a_batch} + {a_row} + ik)) * b.unsafe_load[width=8]({b_batch} + {b_k} + jj)
+{bias_vec}{relu_vec}{vec_body}out.unsafe_store[width=8](out_pos, acc8)
+{vec_body}out_pos += 8
+{vec_body}jj += 8
+{loop2}for jn in range(jj, {n}):
+{vec_body}var acc = Float32(0)
+{vec_body}for ik in range({k}):
+{ik_body}acc = acc + a.unsafe_load({a_batch} + {a_row} + ik) * b.unsafe_load({b_batch} + {b_k} + jn)
+{bias_scalar}{relu_scalar}{vec_body}out.unsafe_store(out_pos, acc)
+{vec_body}out_pos += 1"
+        )
+    } else if kvec_ok {
+        format!(
+            "{loop2}for jn in range({n}):
+{vec_body}var acc8 = SIMD[DType.float32, 8](0)
+{vec_body}var ik = 0
+{vec_body}while ik + 8 <= {k}:
+{ik_body}acc8 = acc8 + a.unsafe_load[width=8]({a_batch} + {a_row} + ik) * b.unsafe_load[width=8]({b_batch} + ik + {b_n})
+{ik_body}ik += 8
+{vec_body}var acc = acc8.reduce_add()
+{vec_body}for ikt in range(ik, {k}):
+{ik_body}acc = acc + a.unsafe_load({a_batch} + {a_row} + ikt) * b.unsafe_load({b_batch} + ikt + {b_n})
+{bias_scalar}{relu_scalar}{vec_body}out.unsafe_store(out_pos, acc)
+{vec_body}out_pos += 1"
+        )
+    } else {
+        format!(
+            "{loop2}for jn in range({n}):
+{vec_body}var acc = Float32(0)
+{vec_body}for ik in range({k}):
+{ik_body}acc = acc + a.unsafe_load({a_batch} + {a_row} + ik) * b.unsafe_load({b_batch} + {b_k} + {b_n})
+{bias_scalar}{relu_scalar}{vec_body}out.unsafe_store(out_pos, acc)
+{vec_body}out_pos += 1"
+        )
+    };
+
+    let batch_open = if batched {
+        format!("    for ib in range({batch}):\n")
     } else {
         String::new()
     };
@@ -856,20 +930,7 @@ def {fn_name}(
 {bias_cast}    var out = out_ptr.unsafe_bitcast[Scalar[DType.float32]]()
     var out_pos = 0
 {batch_open}{row}for im in range({m}):
-{loop2}var jj = 0
-{loop2}while jj + 8 <= {n}:
-{vec_body}var acc8 = SIMD[DType.float32, 8](0)
-{vec_body}for ik in range({k}):
-{ik_body}acc8 = acc8 + SIMD[DType.float32, 8](a.unsafe_load({a_batch}im * {k} + ik)) * b.unsafe_load[width=8]({b_batch}ik * {n} + jj)
-{bias_vec}{relu_vec}{vec_body}out.unsafe_store[width=8](out_pos, acc8)
-{vec_body}out_pos += 8
-{vec_body}jj += 8
-{loop2}for jn in range(jj, {n}):
-{vec_body}var acc = Float32(0)
-{vec_body}for ik in range({k}):
-{ik_body}acc = acc + a.unsafe_load({a_batch}im * {k} + ik) * b.unsafe_load({b_batch}ik * {n} + jn)
-{bias_scalar}{relu_scalar}{vec_body}out.unsafe_store(out_pos, acc)
-{vec_body}out_pos += 1"##
+{inner}"##
     )
 }
 
