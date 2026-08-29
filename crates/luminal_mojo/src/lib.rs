@@ -414,6 +414,7 @@ impl MojoRuntime {
     }
 }
 
+
 // ── Bucket dispatch helper: execute one step ─────────────────────────────
 
 fn execute_step(
@@ -757,3 +758,4 @@ fn eval_iota_expr(terms: &[Term], i: i64) -> i64 {
     }
     stack.pop().unwrap_or(0)
 }
+
