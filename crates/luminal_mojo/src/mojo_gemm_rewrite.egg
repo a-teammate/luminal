@@ -1,0 +1,139 @@
+; MojoGemm rewrites: row-major GEMM + bias/relu epilogue fusion.
+; Structure mirrors cublaslt_RmRm_rewrite.egg + cublaslt_epilogue_rewrite.egg,
+; but the kernel is row-major natively, so there is no column-major swap and
+; no layout/order fields. RELU follows the frontend's maximum-lowering:
+;   relu(x) = (x < 0) * 0 + (1 - (x < 0)) * x
+
+; ── Seed canonical stride spellings ─────────────────────────────────────────
+; HLIR serialization and constant folding leave arbitrary-but-equal spellings
+; in stride eclasses (e.g. z*8388608 vs (z*4096)*2048). Seed the canonical
+; spellings for the [m,n,k] Mul + [m,n] Sum pair; the expr fold rules union a
+; seeded spelling into the actual stride's e-class exactly when the two are
+; numerically equal, so the exact-layout rules below can match.
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
+            (ICons ?lhs (ICons ?rhs (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
+            (ICons ?mul (INil))))
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (= ?mul_shape (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+    )
+    (
+        (let ?c_sum_in_0 (MMul (MMul (MIter) ?k) ?n))
+        (let ?c_sum_in_1 (MMul (MIter) ?k))
+        (let ?c_sum_out_0 (MMul (MIter) ?n))
+        (let ?c_lhs_0 (MMul (MIter) ?k))
+        (let ?c_rhs_2 (MMul (MIter) ?n))
+        (let ?c_mul_out_0 (MMul (MMul (MIter) ?k) ?n))
+        (let ?c_mul_out_1 (MMul (MIter) ?k))
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm seed canonical 2d spellings"
+)
+
+; ── Base: C[m,n] = A[m,k] × B[k,n], row-major, f32 ──────────────────────────
+; A[m,k] → expand [m,n,k] strides [k, 0, 1]
+; B[k,n] → permute [n,k] → expand [m,n,k] strides [0, 1, n]
+; Mul out [m,n,k] contiguous [n*k, k, 1]; Sum over last axis → [m,n] [n, 1]
+
+(rule
+    (
+        (= ?mul (Op (Mul
+            (ECons ?m (ECons ?n (ECons ?k (ENil))))
+            (ECons (MMul (MIter) ?k) (ECons (MNum 0) (ECons (MIter) (ENil))))
+            (ECons (MNum 0) (ECons (MIter) (ECons (MMul (MIter) ?n) (ENil))))
+            (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ECons (MIter) (ENil)))))
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum
+            (ECons ?m (ECons ?n (ENil)))
+            ?k
+            (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ENil)))
+            (MIter)
+            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+            (ICons ?mul (INil))))
+        (!= ?k (MNum 1))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (= ?dt (dtype ?sum))
+        (mojo_gemm_base_dtype ?dt)
+    )
+    (
+        (let ?gemm (Op (MojoGemm ?m ?n ?k "none" "none" ?dt)
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?gemm)
+        (set (dtype ?gemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm 2d row-major"
+)
+
+; ── Bias epilogue: add(gemm_out, bias[n] broadcast over rows) ───────────────
+
+(rule
+    (
+        (= ?gemm (Op (MojoGemm ?m ?n ?k "none" ?act ?dt)
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?add (Op (Add
+            (ECons ?m (ECons ?n (ENil)))
+            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))
+            (ECons (MNum 0) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+            (ICons ?gemm (ICons ?bias (INil)))))
+        (= (dtype ?bias) ?dt)
+    )
+    (
+        (let ?fused (Op (MojoGemm ?m ?n ?k "bias" ?act ?dt)
+            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm column bias epilogue"
+)
+
+; ── Relu epilogue: the frontend's maximum(0, x) lowering ────────────────────
+
+(rule
+    (
+        (= ?gemm (Op (MojoGemm ?m ?n ?k ?bias "none" ?dt)
+            (ICons ?a (ICons ?b ?gemm_tail))))
+
+        (= ?zero (Op (Constant 0.0) (INil)))
+        (= ?neg_one (Op (Constant -1.0) (INil)))
+        (= ?one (Op (Constant 1.0) (INil)))
+
+        (= ?shape2d (ECons ?m (ECons ?n (ENil))))
+        (= ?contig (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+
+        (= ?lt (Op (LessThan ?shape2d ?contig (ECons (MNum 0) (ECons (MNum 0) (ENil))) ?contig)
+            (ICons ?gemm (ICons ?zero (INil)))))
+        (= ?lt_f32 (Op (Cast ?size (F32)) (ICons ?lt (INil))))
+
+        (= ?zeroed (Op (Mul ?shape2d ?contig ?contig ?contig)
+            (ICons ?lt_f32 (ICons ?zero (INil)))))
+        (= ?neg_mask (Op (Mul ?shape2d ?contig ?contig ?contig)
+            (ICons ?lt_f32 (ICons ?neg_one (INil)))))
+        (= ?not_mask_f32 (Op (Add ?shape2d ?contig ?contig ?contig)
+            (ICons ?neg_mask (ICons ?one (INil)))))
+        (= ?not_mask_bool (Op (Cast ?size (Bool)) (ICons ?not_mask_f32 (INil))))
+        (= ?not_mask (Op (Cast ?size (F32)) (ICons ?not_mask_bool (INil))))
+
+        (= ?positive (Op (Mul ?shape2d ?contig ?contig ?contig)
+            (ICons ?not_mask (ICons ?gemm (INil)))))
+        (= ?relu (Op (Add ?shape2d ?contig ?contig ?contig)
+            (ICons ?zeroed (ICons ?positive (INil)))))
+        (= ?dt (dtype ?relu))
+    )
+    (
+        (let ?fused (Op (MojoGemm ?m ?n ?k ?bias "relu" ?dt)
+            (ICons ?a (ICons ?b ?gemm_tail))))
+        (union ?relu ?fused)
+        (set (dtype ?fused) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm relu epilogue"
+)

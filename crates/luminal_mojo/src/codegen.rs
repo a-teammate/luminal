@@ -7,6 +7,8 @@ use std::fmt::Write;
 
 use itertools::Itertools;
 
+use crate::gemm::{MojoGemmLLIR, MojoOp};
+
 use luminal::hlir::{
     Add, Cast, Constant, Exp2, Gather, Iota, Log2, MaxReduce, Mod, Mul, LessThan,
     Recip, Scatter, Sin, Sqrt, SumReduce,
@@ -48,6 +50,8 @@ pub enum StepKind {
     RustGather { indexes: NodeIndex, data: NodeIndex, out: NodeIndex, index_len: usize, data_len: usize, phys_map: Vec<usize> },
     /// Rust-side Scatter: out = copy of dest, then out[dest_phys[indexes[idx_phys[i]]]] = src[src_phys[i]]
     RustScatter { out: NodeIndex, dest: NodeIndex, indexes: NodeIndex, src: NodeIndex, dest_len: usize, index_len: usize, dest_phys: Vec<usize>, idx_phys: Vec<usize>, src_phys: Vec<usize> },
+    /// Fused GEMM: out[m,n] = relu(a[m,k] @ b[k,n] + bias[n])
+    Gemm { a: NodeIndex, b: NodeIndex, bias: Option<NodeIndex>, out: NodeIndex },
 }
 
 #[derive(Clone, Copy)]
@@ -197,6 +201,29 @@ pub fn generate_mojo(
                 kind: StepKind::Copy { src, dst: node },
             });
             continue;
+        }
+
+        // Fused GEMM emitted by the backend's egglog rules
+        if let Some(mojo_op) = llir_op.to_dialect::<dyn MojoOp>() {
+            if let Some(gemm) = mojo_op.as_ref().as_any().downcast_ref::<MojoGemmLLIR>() {
+                let m = resolve_expr(&gemm.m, dyn_map);
+                let n = resolve_expr(&gemm.n, dyn_map);
+                let k = resolve_expr(&gemm.k, dyn_map);
+                let inputs: Vec<NodeIndex> = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .map(|e| e.source())
+                    .collect();
+                let bias = if gemm.bias { Some(inputs[2]) } else { None };
+                buffer_sizes.insert(node, m * n * 4);
+                let fn_name = format!("op_{step_idx}");
+                mojo_funcs.push(gen_gemm(&fn_name, m, n, k, gemm.bias, gemm.relu));
+                exec_plan.push(ExecStep {
+                    func_name: fn_name,
+                    kind: StepKind::Gemm { a: inputs[0], b: inputs[1], bias, out: node },
+                });
+                continue;
+            }
         }
 
         // Try to downcast to dyn ReferenceOp
@@ -643,6 +670,47 @@ def {fn_name}(
 /// `acc_var` is the accumulator name, `acc_init` is the Float32 init value,
 /// `acc_stmt` is the full accumulation statement (e.g. "acc += val" or "if val > best: best = val").
 /// `stride_exprs` are Mojo expressions for the base index into the input, parameterized by loop variables.
+/// Generate a fused GEMM kernel: out[m,n] = relu(a[m,k] @ b[k,n] + bias[n]).
+fn gen_gemm(fn_name: &str, m: usize, n: usize, k: usize, bias: bool, relu: bool) -> String {
+    let params = if bias {
+        "a_ptr: OpaquePointer[MutUntrackedOrigin],\n    b_ptr: OpaquePointer[MutUntrackedOrigin],\n    bias_ptr: OpaquePointer[MutUntrackedOrigin],\n    out_ptr: OpaquePointer[MutUntrackedOrigin]"
+    } else {
+        "a_ptr: OpaquePointer[MutUntrackedOrigin],\n    b_ptr: OpaquePointer[MutUntrackedOrigin],\n    out_ptr: OpaquePointer[MutUntrackedOrigin]"
+    };
+    let bias_cast = if bias {
+        "    var bias = bias_ptr.unsafe_bitcast[Scalar[DType.float32]]()\n"
+    } else {
+        ""
+    };
+    let bias_line = if bias {
+        "            acc = acc + bias.unsafe_load(jn)\n"
+    } else {
+        ""
+    };
+    let relu_lines = if relu {
+        "            if acc < Float32(0):\n                acc = Float32(0)\n"
+    } else {
+        ""
+    };
+    format!(
+        r##"@export("{fn_name}")
+def {fn_name}(
+    {params}
+) abi("C") -> None:
+    var a = a_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var b = b_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+{bias_cast}    var out = out_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var out_pos = 0
+    for im in range({m}):
+        for jn in range({n}):
+            var acc = Float32(0)
+            for ik in range({k}):
+                acc = acc + a.unsafe_load(im * {k} + ik) * b.unsafe_load(ik * {n} + jn)
+{bias_line}{relu_lines}            out.unsafe_store(out_pos, acc)
+            out_pos += 1"##
+    )
+}
+
 fn gen_reduce(
     fn_name: &str,
     acc_var: &str,

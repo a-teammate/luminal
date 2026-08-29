@@ -5,6 +5,9 @@
 //! exported C ABI functions through `libloading`.
 
 mod codegen;
+pub mod gemm;
+
+pub use gemm::{MojoGemm, MojoGemmLLIR, MojoOp};
 
 use std::ffi::CString;
 use std::os::raw::c_void;
@@ -384,6 +387,37 @@ fn execute_step(
             let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
             func(ptr_a, ptr_out);
         }
+        StepKind::Gemm { a, b, bias, out } => {
+            match bias {
+                Some(bias_node) => {
+                    let func: Symbol<
+                        extern "C" fn(*const c_void, *const c_void, *const c_void, *mut c_void),
+                    > = unsafe {
+                        let cname = CString::new(step.func_name.as_str()).unwrap();
+                        lib.get(cname.as_bytes_with_nul())
+                            .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                    };
+                    let ptr_a = buffers[a].as_ptr() as *const c_void;
+                    let ptr_b = buffers[b].as_ptr() as *const c_void;
+                    let ptr_bias = buffers[bias_node].as_ptr() as *const c_void;
+                    let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
+                    func(ptr_a, ptr_b, ptr_bias, ptr_out);
+                }
+                None => {
+                    let func: Symbol<extern "C" fn(*const c_void, *const c_void, *mut c_void)> =
+                        unsafe {
+                            let cname = CString::new(step.func_name.as_str()).unwrap();
+                            lib.get(cname.as_bytes_with_nul()).unwrap_or_else(|e| {
+                                panic!("Symbol {} not found: {e}", step.func_name)
+                            })
+                        };
+                    let ptr_a = buffers[a].as_ptr() as *const c_void;
+                    let ptr_b = buffers[b].as_ptr() as *const c_void;
+                    let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
+                    func(ptr_a, ptr_b, ptr_out);
+                }
+            }
+        }
         StepKind::Reduce { a, out, .. } => {
             let func: Symbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
                 let cname = CString::new(step.func_name.as_str()).unwrap();
@@ -455,7 +489,7 @@ fn execute_step(
 }
 
 impl Runtime for MojoRuntime {
-    type Ops = ();
+    type Ops = gemm::MojoGemm;
     type CompileArg = ();
     type ExecReturn = ();
     type ProfileMetric = Duration;

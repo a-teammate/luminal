@@ -323,3 +323,28 @@ fn transpose_3d() {
         "transpose(1,2) on 3D",
     );
 }
+
+#[test]
+fn gemm_bias_relu_matches_reference() {
+    // a.matmul(b) + bias (broadcast over rows) + relu — the egglog rules should
+    // fuse all of this into a single MojoGemm kernel (base → bias → relu).
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let a = cx.tensor((4, 8));
+            let b = cx.tensor((8, 3));
+            let bias = cx.tensor(3);
+            let out = (a.matmul(b) + bias.expand_dim(0, 4)).relu().output();
+            (
+                vec![
+                    (a.id, gen_data(32, 1.0)),
+                    (b.id, gen_data(24, 2.0)),
+                    // shift negative so some outputs land below zero and relu fires
+                    (bias.id, gen_data(3, 3.0).iter().map(|x| x - 0.6).collect()),
+                ],
+                out.id,
+            )
+        },
+        1e-4,
+        "gemm_bias_relu",
+    );
+}
