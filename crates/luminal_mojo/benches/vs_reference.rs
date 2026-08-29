@@ -14,13 +14,21 @@ use std::time::Instant;
 const WARMUP_ITERS: usize = 3;
 const TIMED_ITERS: usize = 10;
 
-/// Mean wall-clock milliseconds per `execute` call.
-fn time_execution<R: Runtime>(rt: &mut R, dyn_map: &FxHashMap<char, usize>) -> f64 {
+/// Mean wall-clock milliseconds per `execute` call. Inputs are re-fed before
+/// every iteration: ReferenceRuntime::execute consumes its input buffers, so
+/// re-running without re-feeding would panic (and real calls get fresh data
+/// anyway).
+fn time_execution<R: Runtime, F>(rt: &mut R, dyn_map: &FxHashMap<char, usize>, mut feed: F) -> f64
+where
+    F: FnMut(&mut R),
+{
     for _ in 0..WARMUP_ITERS {
+        feed(rt);
         rt.execute(dyn_map);
     }
     let t0 = Instant::now();
     for _ in 0..TIMED_ITERS {
+        feed(rt);
         rt.execute(dyn_map);
     }
     t0.elapsed().as_secs_f64() * 1e3 / TIMED_ITERS as f64
@@ -144,8 +152,16 @@ fn bench_matmul_pipeline() {
         for (id, data) in &inputs {
             rt_ref.set_data(*id, data.clone());
         }
+        // ReferenceRuntime materializes its graph on first execute; get_f32
+        // must run after that (same order as run_reference_and_mojo).
+        rt_ref.execute(&cx_ref.dyn_map);
         let ref_out = rt_ref.get_f32(out).clone();
-        let ref_ms = time_execution(&mut rt_ref, &cx_ref.dyn_map);
+        let ref_inputs = inputs.clone();
+        let ref_ms = time_execution(&mut rt_ref, &cx_ref.dyn_map, |rt| {
+            for (id, d) in &ref_inputs {
+                rt.set_data(*id, d.clone());
+            }
+        });
 
         let mut cx_mj = Graph::new();
         let (inputs, out) = build_matmul_pipeline(&mut cx_mj, size);
@@ -153,8 +169,14 @@ fn bench_matmul_pipeline() {
         for (id, data) in &inputs {
             rt_mj.set_data_f32(*id, data);
         }
+        rt_mj.execute(&cx_mj.dyn_map);
         let mojo_out = rt_mj.get_f32(out);
-        let mojo_ms = time_execution(&mut rt_mj, &cx_mj.dyn_map);
+        let mojo_inputs = inputs.clone();
+        let mojo_ms = time_execution(&mut rt_mj, &cx_mj.dyn_map, |rt| {
+            for (id, d) in &mojo_inputs {
+                rt.set_data_f32(*id, d);
+            }
+        });
 
         let err = max_err(&ref_out, &mojo_out);
         assert!(
@@ -198,8 +220,16 @@ fn bench_transformer_block() {
         for (id, data) in &inputs {
             rt_ref.set_data(*id, data.clone());
         }
+        // ReferenceRuntime materializes its graph on first execute; get_f32
+        // must run after that (same order as run_reference_and_mojo).
+        rt_ref.execute(&cx_ref.dyn_map);
         let ref_out = rt_ref.get_f32(out).clone();
-        let ref_ms = time_execution(&mut rt_ref, &cx_ref.dyn_map);
+        let ref_inputs = inputs.clone();
+        let ref_ms = time_execution(&mut rt_ref, &cx_ref.dyn_map, |rt| {
+            for (id, d) in &ref_inputs {
+                rt.set_data(*id, d.clone());
+            }
+        });
 
         let mut cx_mj = Graph::new();
         cx_mj.set_dim('s', seq);
@@ -208,8 +238,14 @@ fn bench_transformer_block() {
         for (id, data) in &inputs {
             rt_mj.set_data_f32(*id, data);
         }
+        rt_mj.execute(&cx_mj.dyn_map);
         let mojo_out = rt_mj.get_f32(out);
-        let mojo_ms = time_execution(&mut rt_mj, &cx_mj.dyn_map);
+        let mojo_inputs = inputs.clone();
+        let mojo_ms = time_execution(&mut rt_mj, &cx_mj.dyn_map, |rt| {
+            for (id, d) in &mojo_inputs {
+                rt.set_data_f32(*id, d);
+            }
+        });
 
         let err = max_err(&ref_out, &mojo_out);
         assert!(
