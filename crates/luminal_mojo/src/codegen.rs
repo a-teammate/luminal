@@ -21,7 +21,7 @@ use luminal::prelude::petgraph::{
     Direction,
 };
 use luminal::prelude::*;
-use luminal::shape::Term;
+use luminal::shape::{Symbol, Term};
 
 /// A single step in the execution plan.
 #[derive(Clone)]
@@ -102,19 +102,19 @@ pub struct CodegenResult {
 }
 
 /// Resolve an Expression to a concrete usize using dyn_map.
-fn resolve_expr(expr: &Expression, dyn_map: &FxHashMap<char, usize>) -> usize {
+fn resolve_expr(expr: &Expression, dyn_map: &DynMap) -> usize {
     expr.exec(dyn_map)
         .unwrap_or_else(|| panic!("Failed to resolve expression {expr:?} with dyn_map {dyn_map:?}"))
 }
 
 /// Resolve a list of Expressions to concrete usizes.
-fn resolve_exprs(exprs: &[Expression], dyn_map: &FxHashMap<char, usize>) -> Vec<usize> {
+fn resolve_exprs(exprs: &[Expression], dyn_map: &DynMap) -> Vec<usize> {
     exprs.iter().map(|e| resolve_expr(e, dyn_map)).collect()
 }
 
 /// Convert an Expression to Mojo code, resolving dyn_map vars and replacing
 /// remaining variables (like 'z') with the given replacement string.
-fn expr_to_mojo(expr: &Expression, dyn_map: &FxHashMap<char, usize>, z_replace: &str) -> String {
+fn expr_to_mojo(expr: &Expression, dyn_map: &DynMap, z_replace: &str) -> String {
     let resolved = expr.resolve_vars(dyn_map);
     let mut stack: Vec<String> = Vec::new();
     for term in resolved.terms.read().iter() {
@@ -124,7 +124,9 @@ fn expr_to_mojo(expr: &Expression, dyn_map: &FxHashMap<char, usize>, z_replace: 
             // other surviving variable is a named dim that resolve_vars
             // couldn't bind — emitting the loop index there would silently
             // produce a wrong kernel, so fail loudly instead.
-            Term::Var(v) if *v == 'z' => stack.push(z_replace.to_string()),
+            Term::Var(v) if *v == Symbol::reserved_index() => {
+                stack.push(z_replace.to_string())
+            }
             Term::Var(v) => {
                 panic!("unresolved dim '{v}' in expression {expr:?} (dyn_map {dyn_map:?})")
             }
@@ -176,7 +178,7 @@ fn expr_to_mojo(expr: &Expression, dyn_map: &FxHashMap<char, usize>, z_replace: 
 /// `dyn_map` resolves dynamic dimension symbols to concrete values.
 pub fn generate_mojo(
     llir_graph: &LLIRGraph,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
 ) -> CodegenResult {
     let topo = toposort(llir_graph, None).unwrap_or_else(|e| panic!("Cycle in LLIR: {:?}", e));
 

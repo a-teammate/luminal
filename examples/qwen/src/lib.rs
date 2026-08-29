@@ -148,7 +148,7 @@ impl QwenRuntime for luminal_mojo::MojoRuntime {
         luminal_mojo::MojoRuntime::get_f32(self, id)
     }
 
-    fn prepare_execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn prepare_execute(&mut self, dyn_map: &luminal::shape::DynMap) {
         luminal_mojo::MojoRuntime::prepare_execute(self, dyn_map);
     }
 }

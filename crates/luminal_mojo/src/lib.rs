@@ -14,14 +14,14 @@ pub use norm::{MojoRMSNorm, MojoRMSNormLLIR, MojoSoftmax, MojoSoftmaxLLIR};
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::process::Command;
-use std::time::Duration;
 
 use codegen::{generate_mojo, ExecStep, StepKind};
-use luminal::shape::Term;
-use libloading::{Library, Symbol};
+use luminal::shape::{DynMap, Term};
+use libloading::{Library, Symbol as LibSymbol};
 use luminal::op::Runtime;
 use luminal::prelude::*;
-use luminal::graph::{BucketLLIR, DimBucket};
+use luminal::graph::DimBucket;
+use luminal::search::SearchSpace;
 use luminal::hlir::Input;
 
 const SAFETY_PAD: usize = 4096;
@@ -39,13 +39,13 @@ struct MojoBucket {
     /// introspection and to consume `CodegenResult::output_nodes`.
     #[allow(dead_code)]
     output_nodes: FxHashSet<NodeIndex>,
-    representative_dyn_map: FxHashMap<char, usize>,
+    representative_dyn_map: DynMap,
 }
 
 pub struct MojoRuntime {
     // Per-bucket compiled graphs
     buckets: Vec<MojoBucket>,
-    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    dim_buckets: FxHashMap<luminal::shape::Symbol, Vec<DimBucket>>,
     active_bucket: usize,
 
     /// LLIR buffer arena, partitioned per bucket (parallel to `buckets`).
@@ -63,9 +63,6 @@ pub struct MojoRuntime {
     /// Pending inputs set before any load_llir call (HLIR-keyed)
     pending_inputs: FxHashMap<NodeIndex, Vec<u8>>,
 
-    /// Dyn map captured during filter_llir_candidate
-    captured_dyn_map: FxHashMap<char, usize>,
-
     /// Actual data size (in f32 elements) per LLIR node, per bucket
     data_len: Vec<FxHashMap<NodeIndex, usize>>,
 }
@@ -80,7 +77,6 @@ impl Default for MojoRuntime {
             hlir_data: FxHashMap::default(),
             dirty: FxHashSet::default(),
             pending_inputs: FxHashMap::default(),
-            captured_dyn_map: FxHashMap::default(),
             data_len: Vec::new(),
         }
     }
@@ -205,7 +201,7 @@ impl MojoRuntime {
     }
 
     /// Hook called before each execute — can be used for bucket pre-selection.
-    pub fn prepare_execute(&mut self, _dyn_map: &FxHashMap<char, usize>) {}
+    pub fn prepare_execute(&mut self, _dyn_map: &DynMap) {}
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
@@ -275,7 +271,7 @@ impl MojoRuntime {
 
     /// Call luminal_init to initialize Mojo runtime
     fn call_init(lib: &Library) {
-        let init_fn: Symbol<extern "C" fn()> = unsafe {
+        let init_fn: LibSymbol<extern "C" fn()> = unsafe {
             lib.get(b"luminal_init\0")
                 .expect("luminal_init symbol not found")
         };
@@ -284,7 +280,7 @@ impl MojoRuntime {
 
     /// Find the bucket whose range covers the requested dyn_map values.
     /// Picks the smallest qualifying bucket.
-    fn find_bucket(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn find_bucket(&self, dyn_map: &DynMap) -> usize {
         if self.buckets.len() <= 1 {
             return 0;
         }
@@ -425,11 +421,11 @@ fn execute_step(
 ) {
     match &step.kind {
         StepKind::Binary { a, b, out, .. } => {
-            let func: Symbol<extern "C" fn(*const c_void, *const c_void, *mut c_void)> =
+            let func: LibSymbol<extern "C" fn(*const c_void, *const c_void, *mut c_void)> =
                 unsafe {
                     let cname = CString::new(step.func_name.as_str()).unwrap();
                     lib.get(cname.as_bytes_with_nul())
-                        .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                        .unwrap_or_else(|e| panic!("LibSymbol {} not found: {e}", step.func_name))
                 };
             let ptr_a = buffers[a].as_ptr() as *const c_void;
             let ptr_b = buffers[b].as_ptr() as *const c_void;
@@ -437,10 +433,10 @@ fn execute_step(
             func(ptr_a, ptr_b, ptr_out);
         }
         StepKind::Unary { a, out, .. } => {
-            let func: Symbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
+            let func: LibSymbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
                 let cname = CString::new(step.func_name.as_str()).unwrap();
                 lib.get(cname.as_bytes_with_nul())
-                    .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                    .unwrap_or_else(|e| panic!("LibSymbol {} not found: {e}", step.func_name))
             };
             let ptr_a = buffers[a].as_ptr() as *const c_void;
             let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
@@ -449,12 +445,12 @@ fn execute_step(
         StepKind::Gemm { a, b, bias, out } => {
             match bias {
                 Some(bias_node) => {
-                    let func: Symbol<
+                    let func: LibSymbol<
                         extern "C" fn(*const c_void, *const c_void, *const c_void, *mut c_void),
                     > = unsafe {
                         let cname = CString::new(step.func_name.as_str()).unwrap();
                         lib.get(cname.as_bytes_with_nul())
-                            .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                            .unwrap_or_else(|e| panic!("LibSymbol {} not found: {e}", step.func_name))
                     };
                     let ptr_a = buffers[a].as_ptr() as *const c_void;
                     let ptr_b = buffers[b].as_ptr() as *const c_void;
@@ -463,11 +459,11 @@ fn execute_step(
                     func(ptr_a, ptr_b, ptr_bias, ptr_out);
                 }
                 None => {
-                    let func: Symbol<extern "C" fn(*const c_void, *const c_void, *mut c_void)> =
+                    let func: LibSymbol<extern "C" fn(*const c_void, *const c_void, *mut c_void)> =
                         unsafe {
                             let cname = CString::new(step.func_name.as_str()).unwrap();
                             lib.get(cname.as_bytes_with_nul()).unwrap_or_else(|e| {
-                                panic!("Symbol {} not found: {e}", step.func_name)
+                                panic!("LibSymbol {} not found: {e}", step.func_name)
                             })
                         };
                     let ptr_a = buffers[a].as_ptr() as *const c_void;
@@ -478,20 +474,20 @@ fn execute_step(
             }
         }
         StepKind::RmsNorm { x, out, .. } | StepKind::Softmax { x, out, .. } => {
-            let func: Symbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
+            let func: LibSymbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
                 let cname = CString::new(step.func_name.as_str()).unwrap();
                 lib.get(cname.as_bytes_with_nul())
-                    .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                    .unwrap_or_else(|e| panic!("LibSymbol {} not found: {e}", step.func_name))
             };
             let ptr_x = buffers[x].as_ptr() as *const c_void;
             let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
             func(ptr_x, ptr_out);
         }
         StepKind::Reduce { a, out, .. } => {
-            let func: Symbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
+            let func: LibSymbol<extern "C" fn(*const c_void, *mut c_void)> = unsafe {
                 let cname = CString::new(step.func_name.as_str()).unwrap();
                 lib.get(cname.as_bytes_with_nul())
-                    .unwrap_or_else(|e| panic!("Symbol {} not found: {e}", step.func_name))
+                    .unwrap_or_else(|e| panic!("LibSymbol {} not found: {e}", step.func_name))
             };
             let ptr_a = buffers[a].as_ptr() as *const c_void;
             let ptr_out = buffers.get_mut(out).unwrap().as_mut_ptr() as *mut c_void;
@@ -561,18 +557,60 @@ impl Runtime for MojoRuntime {
     type Ops = (gemm::MojoGemm, norm::MojoRMSNorm, norm::MojoSoftmax);
     type CompileArg = ();
     type ExecReturn = ();
-    type ProfileMetric = Duration;
 
     fn initialize(_: Self::CompileArg) -> Self {
         Self::default()
     }
 
+    /// We don't profile, so pick one program per bucket via `extract_one`
+    /// and codegen each against its bucket's representative dyn map.
+    fn compile(
+        &mut self,
+        space: &SearchSpace,
+        dyn_map: &DynMap,
+        _options: &luminal::graph::CompileOptions,
+        rng: &mut dyn rand::RngCore,
+    ) {
+        self.dim_buckets = space.dim_buckets.clone();
+        self.buckets.clear();
+
+        for ctx in space.bucket_contexts(dyn_map) {
+            let llir_graph = luminal::search::extract_one(space, &ctx, rng);
+            let result = generate_mojo(&llir_graph, &ctx.representative_dyn_map);
+            let lib = Self::compile_and_load(&result.mojo_source);
+            Self::call_init(&lib);
+
+            self.buckets.push(MojoBucket {
+                lib,
+                exec_plan: result.exec_plan,
+                buffer_sizes: result.buffer_sizes.clone(),
+                input_map: result.input_hlir_to_llir,
+                output_map: result.output_hlir_to_llir,
+                input_nodes: result.input_nodes,
+                output_nodes: result.output_nodes,
+                representative_dyn_map: ctx.representative_dyn_map.clone(),
+            });
+        }
+
+        self.active_bucket = 0;
+        self.buffers.truncate(self.buckets.len());
+        self.data_len.truncate(self.buckets.len());
+        self.allocate_bucket_buffers();
+
+        // Flush inputs set before compile (single-bucket case, as before)
+        if self.buckets.len() == 1 {
+            let pending = std::mem::take(&mut self.pending_inputs);
+            for (hlir_node, data) in pending {
+                if let Some(&llir_node) = self.buckets[0].input_map.get(&hlir_node) {
+                    self.data_len[0].insert(llir_node, data.len() / 4);
+                    Self::write_input_buffer(&mut self.buffers[0], llir_node, &data);
+                }
+            }
+        }
+    }
+
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
-        let dyn_map = if self.captured_dyn_map.is_empty() {
-            FxHashMap::default()
-        } else {
-            self.captured_dyn_map.clone()
-        };
+        let dyn_map = DynMap::default();
         let result = generate_mojo(llir_graph, &dyn_map);
 
         let lib = Self::compile_and_load(&result.mojo_source);
@@ -605,51 +643,9 @@ impl Runtime for MojoRuntime {
         }
     }
 
-    fn load_llir_buckets(
-        &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-        bucket_llirs: &[BucketLLIR],
-    ) {
-        if bucket_llirs.len() == 1 {
-            self.load_llir(&bucket_llirs[0].2);
-            return;
-        }
 
-        self.dim_buckets = dim_buckets.clone();
-        self.buckets.clear();
 
-        for (_bucket_indices, representative_dyn_map, llir_graph) in bucket_llirs {
-            let result = generate_mojo(llir_graph, representative_dyn_map);
-            let lib = Self::compile_and_load(&result.mojo_source);
-            Self::call_init(&lib);
-
-            self.buckets.push(MojoBucket {
-                lib,
-                exec_plan: result.exec_plan,
-                buffer_sizes: result.buffer_sizes.clone(),
-                input_map: result.input_hlir_to_llir,
-                output_map: result.output_hlir_to_llir,
-                input_nodes: result.input_nodes,
-                output_nodes: result.output_nodes,
-                representative_dyn_map: representative_dyn_map.clone(),
-            });
-        }
-        self.active_bucket = 0;
-        self.buffers.truncate(self.buckets.len());
-        self.data_len.truncate(self.buckets.len());
-        self.allocate_bucket_buffers();
-    }
-
-    fn filter_llir_candidate(
-        &mut self,
-        _llir_graph: &LLIRGraph,
-        context: luminal::op::CandidateFilterContext<'_>,
-    ) -> luminal::op::CandidateFilterResult {
-        self.captured_dyn_map = context.dyn_map.clone();
-        luminal::op::CandidateFilterResult::accept()
-    }
-
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
         // Select bucket
         let new_active = self.find_bucket(dyn_map);
         if new_active != self.active_bucket && !self.buckets.is_empty() {
@@ -675,16 +671,6 @@ impl Runtime for MojoRuntime {
         }
     }
 
-    fn profile(
-        &mut self,
-        _llir_graph: &LLIRGraph,
-        _dyn_map: &FxHashMap<char, usize>,
-        _trials: usize,
-        _timeout: Option<Duration>,
-        _early_stop: Option<(Self::ProfileMetric, f64)>,
-    ) -> (Self::ProfileMetric, String) {
-        (Duration::ZERO, "0 ms".to_string())
-    }
 }
 
 /// Evaluate an Iota expression with z = i, returning an integer value.

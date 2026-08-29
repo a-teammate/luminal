@@ -18,7 +18,11 @@ const TIMED_ITERS: usize = 10;
 /// every iteration: ReferenceRuntime::execute consumes its input buffers, so
 /// re-running without re-feeding would panic (and real calls get fresh data
 /// anyway).
-fn time_execution<R: Runtime, F>(rt: &mut R, dyn_map: &FxHashMap<char, usize>, mut feed: F) -> f64
+fn time_execution<R: Runtime, F>(
+    rt: &mut R,
+    dyn_map: &luminal::shape::DynMap,
+    mut feed: F,
+) -> f64
 where
     F: FnMut(&mut R),
 {
