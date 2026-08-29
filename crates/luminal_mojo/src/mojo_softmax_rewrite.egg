@@ -1,0 +1,86 @@
+; MojoSoftmax rewrites: row-wise softmax fusion.
+; Matches the canonical lowering of
+;   out[r,c] = exp(x[r,c] - max(x[r,:])) / Σ_c exp(x[r,c] - max(x[r,:]))
+; i.e. Max(last axis) → Mul by -1 scalar → Add → Mul by 1/ln(2) scalar →
+; Exp2 → Sum(last axis) → Recip (broadcast) → Mul back onto the exp values.
+; The two scalar constants are bound generically: the kernel computes
+;   out = exp2((x + c1·max_row)·c2) / Σ_c exp2((x + c1·max_row)·c2)
+; which is exact softmax for the c1 = -1, c2 = 1/ln(2) instantiation (and any
+; other constants would still be the same function of x, just shifted/scaled).
+; Spellings mirror the post-normalization e-graph exactly (MIter spellings).
+
+(rule
+    (
+        ; row max: [rows], iters=cols, input strides [cols], iter stride z,
+        ; out strides [z]
+        (= ?mx (Op (Max
+            (ECons ?rows (ENil))
+            ?cols
+            (ECons (MMul (MIter) ?cols) (ENil))
+            (MIter)
+            (ECons (MIter) (ENil)))
+            (ICons ?x (INil))))
+        ; neg = max_row * c1, broadcast: max strides [z, 0], scalar [0, 0]
+        (= ?neg_c (Op (Constant ?c1) (INil)))
+        (= ?neg (Op (Mul
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MIter) (ECons (MNum 0) (ENil)))
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?mx (ICons ?neg_c (INil)))))
+        ; shifted = x + neg, all-contiguous [cols, 1]
+        (= ?shifted (Op (Add
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?x (ICons ?neg (INil)))))
+        ; scaled = shifted * c2, scalar broadcast [0, 0]
+        (= ?scale_c (Op (Constant ?c2) (INil)))
+        (= ?scaled (Op (Mul
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?shifted (ICons ?scale_c (INil)))))
+        (= ?exp (Op (Exp2
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?scaled (INil))))
+        ; row sum of exp: [rows]
+        (= ?sum (Op (Sum
+            (ECons ?rows (ENil))
+            ?cols
+            (ECons (MMul (MIter) ?cols) (ENil))
+            (MIter)
+            (ECons (MIter) (ENil)))
+            (ICons ?exp (INil))))
+        ; recip: shape [rows, cols], reads sum broadcast at [z, 0], out contiguous
+        (= ?recip (Op (Recip
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MIter) (ECons (MNum 0) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?sum (INil))))
+        ; out = exp * recip, all-contiguous
+        (= ?soft (Op (Mul
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?exp (ICons ?recip (INil)))))
+        (!= ?cols (MNum 1))
+        (!= ?rows (MNum 0))
+        (!= ?cols (MNum 0))
+        (= ?dt (dtype ?soft))
+        (mojo_softmax_base_dtype ?dt)
+    )
+    (
+        (let ?fused (Op (MojoSoftmax ?rows ?cols ?c1 ?c2 ?dt)
+            (ICons ?x (INil))))
+        (union ?soft ?fused)
+        (set (dtype ?fused) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo softmax fuse"
+)

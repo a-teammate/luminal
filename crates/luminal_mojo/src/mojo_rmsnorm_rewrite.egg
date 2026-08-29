@@ -1,0 +1,82 @@
+; MojoRMSNorm rewrites: row-wise RMSNorm fusion.
+; Matches the canonical lowering of
+;   out[r,c] = x[r,c] * rsqrt(mean(x[r,:]²) + eps)
+; i.e. Mul(x,x) → Sum(last axis) → Mul by Recip(Cast(Iota(cols,1))) →
+; Add eps scalar → Sqrt → Recip → broadcast Mul back onto x.
+; Spellings mirror the post-normalization e-graph exactly (MIter spellings;
+; the *1 and ×0 stride unions are already provided by the base expr rules,
+; so no seed rules are needed).
+
+(rule
+    (
+        ; sq = x*x on [rows, cols], all-contiguous strides [cols, 1]
+        (= ?sq (Op (Mul
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?x (ICons ?x (INil)))))
+        ; row sum: [rows], iters=cols, input strides [cols], iter stride z,
+        ; out strides [z]
+        (= ?sum (Op (Sum
+            (ECons ?rows (ENil))
+            ?cols
+            (ECons (MMul (MIter) ?cols) (ENil))
+            (MIter)
+            (ECons (MIter) (ENil)))
+            (ICons ?sq (INil))))
+        ; mean divisor: recip(cast(iota(cols, 1) to f32)) broadcast over [rows]
+        (= ?n_iota (Op (Iota ?cols (MNum 1)) (INil)))
+        (= ?n_f32 (Op (Cast (MNum 1) (F32)) (ICons ?n_iota (INil))))
+        (= ?n_recip (Op (Recip
+            (ECons ?rows (ENil))
+            (ECons (MNum 0) (ENil))
+            (ECons (MIter) (ENil)))
+            (ICons ?n_f32 (INil))))
+        ; mean = sum * 1/cols
+        (= ?mean (Op (Mul
+            (ECons ?rows (ENil))
+            (ECons (MIter) (ENil))
+            (ECons (MIter) (ENil))
+            (ECons (MIter) (ENil)))
+            (ICons ?sum (ICons ?n_recip (INil)))))
+        ; + eps scalar (broadcast stride 0)
+        (= ?eps (Op (Constant ?eps_val) (INil)))
+        (= ?eps_add (Op (Add
+            (ECons ?rows (ENil))
+            (ECons (MIter) (ENil))
+            (ECons (MNum 0) (ENil))
+            (ECons (MIter) (ENil)))
+            (ICons ?mean (ICons ?eps (INil)))))
+        (= ?sqrt (Op (Sqrt
+            (ECons ?rows (ENil))
+            (ECons (MIter) (ENil))
+            (ECons (MIter) (ENil)))
+            (ICons ?eps_add (INil))))
+        (= ?rsqrt (Op (Recip
+            (ECons ?rows (ENil))
+            (ECons (MIter) (ENil))
+            (ECons (MIter) (ENil)))
+            (ICons ?sqrt (INil))))
+        ; out = x * ms[r]: broadcast mul, x contiguous, ms strides [z, 0]
+        (= ?normed (Op (Mul
+            (ECons ?rows (ECons ?cols (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil)))
+            (ECons (MIter) (ECons (MNum 0) (ENil)))
+            (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+            (ICons ?x (ICons ?rsqrt (INil)))))
+        (!= ?cols (MNum 1))
+        (!= ?rows (MNum 0))
+        (!= ?cols (MNum 0))
+        (= ?dt (dtype ?normed))
+        (mojo_rmsnorm_base_dtype ?dt)
+    )
+    (
+        (let ?fused (Op (MojoRMSNorm ?rows ?cols ?eps_val ?dt)
+            (ICons ?x (INil))))
+        (union ?normed ?fused)
+        (set (dtype ?fused) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo rmsnorm fuse"
+)

@@ -8,6 +8,7 @@ use std::fmt::Write;
 use itertools::Itertools;
 
 use crate::gemm::{MojoGemmLLIR, MojoOp};
+use crate::norm::{MojoRMSNormLLIR, MojoSoftmaxLLIR};
 
 use luminal::hlir::{
     Add, Cast, Constant, Exp2, Gather, Iota, Log2, MaxReduce, Mod, Mul, LessThan,
@@ -53,6 +54,12 @@ pub enum StepKind {
     /// Fused GEMM: out[b,m,n] = relu(a[b,m,k] @ b[b,k,n] + bias[n]); batch is
     /// baked into the emitted kernel, so the FFI signature stays pointer-only
     Gemm { a: NodeIndex, b: NodeIndex, bias: Option<NodeIndex>, out: NodeIndex },
+    /// Fused RMSNorm: out[r,c] = x[r,c] * (mean(x[r,:]²)+eps)^-0.5; rows/cols/eps
+    /// are baked into the emitted kernel, so the FFI signature is pointer-only
+    RmsNorm { x: NodeIndex, out: NodeIndex, rows: usize, cols: usize, eps: f32 },
+    /// Fused softmax: out[r,c] = exp2((x[r,c]+c1·max_row)·c2) / Σ_c exp2((x[r,c]+c1·max_row)·c2);
+    /// rows/cols/c1/c2 are baked into the emitted kernel
+    Softmax { x: NodeIndex, out: NodeIndex, rows: usize, cols: usize, c1: f32, c2: f32 },
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +230,40 @@ pub fn generate_mojo(
                 exec_plan.push(ExecStep {
                     func_name: fn_name,
                     kind: StepKind::Gemm { a: inputs[0], b: inputs[1], bias, out: node },
+                });
+                continue;
+            }
+            if let Some(norm) = mojo_op.as_ref().as_any().downcast_ref::<MojoRMSNormLLIR>() {
+                let rows = resolve_expr(&norm.rows, dyn_map);
+                let cols = resolve_expr(&norm.cols, dyn_map);
+                let inputs: Vec<NodeIndex> = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .map(|e| e.source())
+                    .collect();
+                buffer_sizes.insert(node, rows * cols * 4);
+                let fn_name = format!("op_{step_idx}");
+                mojo_funcs.push(gen_rmsnorm(&fn_name, rows, cols, norm.eps));
+                exec_plan.push(ExecStep {
+                    func_name: fn_name,
+                    kind: StepKind::RmsNorm { x: inputs[0], out: node, rows, cols, eps: norm.eps },
+                });
+                continue;
+            }
+            if let Some(soft) = mojo_op.as_ref().as_any().downcast_ref::<MojoSoftmaxLLIR>() {
+                let rows = resolve_expr(&soft.rows, dyn_map);
+                let cols = resolve_expr(&soft.cols, dyn_map);
+                let inputs: Vec<NodeIndex> = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .map(|e| e.source())
+                    .collect();
+                buffer_sizes.insert(node, rows * cols * 4);
+                let fn_name = format!("op_{step_idx}");
+                mojo_funcs.push(gen_softmax(&fn_name, rows, cols, soft.c1, soft.c2));
+                exec_plan.push(ExecStep {
+                    func_name: fn_name,
+                    kind: StepKind::Softmax { x: inputs[0], out: node, rows, cols, c1: soft.c1, c2: soft.c2 },
                 });
                 continue;
             }
@@ -672,6 +713,84 @@ def {fn_name}(
 /// `acc_var` is the accumulator name, `acc_init` is the Float32 init value,
 /// `acc_stmt` is the full accumulation statement (e.g. "acc += val" or "if val > best: best = val").
 /// `stride_exprs` are Mojo expressions for the base index into the input, parameterized by loop variables.
+/// Generate a fused RMSNorm kernel: out[r,c] = x[r,c] * (mean(x[r,:]²)+eps)^-0.5.
+/// Vectorized 8-wide along the row (the contiguous axis) with a scalar tail for
+/// c % 8; rows/cols/eps are baked into the kernel, keeping the FFI signature
+/// pointer-only.
+fn gen_rmsnorm(fn_name: &str, rows: usize, cols: usize, eps: f32) -> String {
+    format!(
+        r##"@export("{fn_name}")
+def {fn_name}(
+    x_ptr: OpaquePointer[MutUntrackedOrigin],
+    out_ptr: OpaquePointer[MutUntrackedOrigin],
+) abi("C") -> None:
+    var x = x_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var out = out_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var out_pos = 0
+    for im in range({rows}):
+        var acc8 = SIMD[DType.float32, 8](0)
+        var jj = 0
+        while jj + 8 <= {cols}:
+            var v8 = x.unsafe_load[width=8](im * {cols} + jj)
+            acc8 = acc8 + v8 * v8
+            jj += 8
+        var acc = Float32(0)
+        for ic in range(8):
+            acc = acc + acc8[ic]
+        for jn in range(jj, {cols}):
+            var v = x.unsafe_load(im * {cols} + jn)
+            acc = acc + v * v
+        acc = acc / {cols}.0 + {eps:?}
+        var scale = 1.0 / sqrt(acc)
+        for jn in range({cols}):
+            out.unsafe_store(out_pos, x.unsafe_load(im * {cols} + jn) * scale)
+            out_pos += 1"##
+    )
+}
+
+/// Generate a fused softmax kernel:
+/// out[r,c] = exp2((x[r,c]+c1·max_row)·c2) / Σ_c exp2((x[r,c]+c1·max_row)·c2).
+/// Three row passes: scalar max, vectorized (8-wide) exp2-sum, then scale-and-store.
+/// rows/cols/c1/c2 are baked into the kernel, keeping the FFI signature
+/// pointer-only.
+fn gen_softmax(fn_name: &str, rows: usize, cols: usize, c1: f32, c2: f32) -> String {
+    format!(
+        r##"@export("{fn_name}")
+def {fn_name}(
+    x_ptr: OpaquePointer[MutUntrackedOrigin],
+    out_ptr: OpaquePointer[MutUntrackedOrigin],
+) abi("C") -> None:
+    var x = x_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var out = out_ptr.unsafe_bitcast[Scalar[DType.float32]]()
+    var out_pos = 0
+    for im in range({rows}):
+        var base = im * {cols}
+        var mx = x.unsafe_load(base)
+        for jn in range(1, {cols}):
+            var mv = x.unsafe_load(base + jn)
+            if mv > mx:
+                mx = mv
+        var acc8 = SIMD[DType.float32, 8](0)
+        var jj = 0
+        while jj + 8 <= {cols}:
+            var v8 = x.unsafe_load[width=8](base + jj) + {c1:?} * mx
+            var e8 = exp2(v8 * {c2:?})
+            acc8 = acc8 + e8
+            jj += 8
+        var acc = Float32(0)
+        for ic in range(8):
+            acc = acc + acc8[ic]
+        for jn in range(jj, {cols}):
+            var v = x.unsafe_load(base + jn) + {c1:?} * mx
+            acc = acc + exp2(v * {c2:?})
+        var scale = 1.0 / acc
+        for jn in range({cols}):
+            var v = x.unsafe_load(base + jn) + {c1:?} * mx
+            out.unsafe_store(out_pos, exp2(v * {c2:?}) * scale)
+            out_pos += 1"##
+    )
+}
+
 /// Generate a fused GEMM kernel: out[b,m,n] = relu(a[b,m,k] @ b[b,k,n] + bias[n]).
 /// Vectorized 8-wide along n (the only contiguous axis: b's rows and bias are
 /// contiguous in n) with a scalar tail for n % 8; `batch` is baked into the

@@ -370,3 +370,34 @@ fn gemm_batched_matches_reference() {
         "gemm_batched",
     );
 }
+
+#[test]
+fn rmsnorm_matches_reference() {
+    // RMSNorm: out[r,c] = x[r,c] * (mean(x[r,:]²)+eps)^-0.5 — the backend's
+    // rewrite should fuse this into a single MojoRMSNorm kernel.
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let a = cx.tensor((4, 8));
+            let ms = ((a * a).mean(1) + 1e-6f32).sqrt().reciprocal();
+            let out = (a * ms.expand_dim(1, 8)).output();
+            (vec![(a.id, gen_data(32, 1.0))], out.id)
+        },
+        1e-4,
+        "rmsnorm",
+    );
+}
+
+#[test]
+fn softmax_matches_reference() {
+    // Softmax: out[r,c] = exp(x[r,c]-max(x[r,:])) / Σ_c exp(x[r,c]-max(x[r,:]))
+    // — the backend's rewrite should fuse this into a single MojoSoftmax kernel.
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let a = cx.tensor((4, 8));
+            let out = a.softmax(1).output();
+            (vec![(a.id, gen_data(32, 1.0))], out.id)
+        },
+        1e-4,
+        "softmax",
+    );
+}
