@@ -120,6 +120,39 @@ impl QwenRuntime for luminal_metal::MetalRuntime {
     }
 }
 
+#[cfg(feature = "mojo")]
+impl QwenRuntime for luminal_mojo::MojoRuntime {
+    type Buffer = Vec<u8>;
+
+    fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
+        luminal_mojo::MojoRuntime::load_safetensors(self, cx, file_path);
+    }
+
+    fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>) {
+        luminal_mojo::MojoRuntime::set_i32_data(self, id, data);
+    }
+
+    fn set_zeros(&mut self, id: NodeIndex, num_bytes: usize) {
+        luminal_mojo::MojoRuntime::set_zeros(self, id, num_bytes);
+    }
+
+    fn remove_buffer(&mut self, id: NodeIndex) -> Self::Buffer {
+        luminal_mojo::MojoRuntime::remove_buffer(self, id)
+    }
+
+    fn set_buffer(&mut self, id: NodeIndex, buffer: Self::Buffer) {
+        luminal_mojo::MojoRuntime::set_buffer(self, id, buffer);
+    }
+
+    fn get_f32(&self, id: NodeIndex) -> Vec<f32> {
+        luminal_mojo::MojoRuntime::get_f32(self, id)
+    }
+
+    fn prepare_execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        luminal_mojo::MojoRuntime::prepare_execute(self, dyn_map);
+    }
+}
+
 pub fn run_qwen<R>(mut runtime: R, config: QwenRunConfig) -> Result<(), Box<dyn Error>>
 where
     R: QwenRuntime + 'static,
