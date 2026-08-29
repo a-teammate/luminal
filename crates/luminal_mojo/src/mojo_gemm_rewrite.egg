@@ -33,6 +33,35 @@
     :name "mojo gemm seed canonical 2d spellings"
 )
 
+; Same seeding for the batched pair: Mul [b,m,n,k] + Sum [b,m,n].
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
+            (ICons ?lhs (ICons ?rhs (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
+            (ICons ?mul (INil))))
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (= ?mul_shape (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil))))))
+    )
+    (
+        (let ?c_sum_in_0 (MMul (MMul (MMul (MIter) ?k) ?n) ?m))
+        (let ?c_sum_in_1 (MMul (MMul (MIter) ?k) ?n))
+        (let ?c_sum_in_2 (MMul (MIter) ?k))
+        (let ?c_sum_out_0 (MMul (MMul (MIter) ?n) ?m))
+        (let ?c_sum_out_1 (MMul (MIter) ?n))
+        (let ?c_lhs_0 (MMul (MMul (MIter) ?k) ?m))
+        (let ?c_lhs_1 (MMul (MIter) ?k))
+        (let ?c_rhs_0 (MMul (MMul (MIter) ?k) ?n))
+        (let ?c_rhs_3 (MMul (MIter) ?n))
+        (let ?c_mul_out_0 (MMul (MMul (MMul (MIter) ?k) ?n) ?m))
+        (let ?c_mul_out_1 (MMul (MMul (MIter) ?k) ?n))
+        (let ?c_mul_out_2 (MMul (MIter) ?k))
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm seed canonical 3d spellings"
+)
+
 ; ── Base: C[m,n] = A[m,k] × B[k,n], row-major, f32 ──────────────────────────
 ; A[m,k] → expand [m,n,k] strides [k, 0, 1]
 ; B[k,n] → permute [n,k] → expand [m,n,k] strides [0, 1, n]
@@ -62,7 +91,7 @@
         (mojo_gemm_base_dtype ?dt)
     )
     (
-        (let ?gemm (Op (MojoGemm ?m ?n ?k "none" "none" ?dt)
+        (let ?gemm (Op (MojoGemm ?m ?n ?k (MNum 1) "none" "none" ?dt)
             (ICons ?a (ICons ?b (INil)))))
         (union ?sum ?gemm)
         (set (dtype ?gemm) ?dt)
@@ -71,11 +100,53 @@
     :name "mojo gemm 2d row-major"
 )
 
+; ── Base 3D: C[b,m,n] = A[b,m,k] × B[b,k,n], row-major slices, f32 ──────────
+; A[b,m,k] → expand [b,m,n,k] strides [m*k, k, 0, 1]
+; B[b,k,n] → permute (0,2,1) → [b,n,k] → expand [b,m,n,k] strides [k*n, 0, 1, n]
+; (the frontend's 3d matmul permutes B, so B's n axis is the contiguous one —
+; the same layout the 2d rule sees after its (1,0) permute)
+; Mul out [b,m,n,k] contiguous [m*n*k, n*k, k, 1]; Sum over last axis →
+; [b,m,n] out strides [m*n, n, 1]
+
+(rule
+    (
+        (= ?mul (Op (Mul
+            (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+            (ECons (MMul (MMul (MIter) ?k) ?m) (ECons (MMul (MIter) ?k) (ECons (MNum 0) (ECons (MIter) (ENil)))))
+            (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MNum 0) (ECons (MIter) (ECons (MMul (MIter) ?n) (ENil)))))
+            (ECons (MMul (MMul (MMul (MIter) ?k) ?n) ?m) (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ECons (MIter) (ENil))))))
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?k
+            (ECons (MMul (MMul (MMul (MIter) ?k) ?n) ?m) (ECons (MMul (MMul (MIter) ?k) ?n) (ECons (MMul (MIter) ?k) (ENil))))
+            (MIter)
+            (ECons (MMul (MMul (MIter) ?n) ?m) (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))))
+            (ICons ?mul (INil))))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (= ?dt (dtype ?sum))
+        (mojo_gemm_base_dtype ?dt)
+    )
+    (
+        (let ?gemm (Op (MojoGemm ?m ?n ?k ?batch "none" "none" ?dt)
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?gemm)
+        (set (dtype ?gemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "mojo gemm 3d batched row-major"
+)
+
 ; ── Bias epilogue: add(gemm_out, bias[n] broadcast over rows) ───────────────
 
 (rule
     (
-        (= ?gemm (Op (MojoGemm ?m ?n ?k "none" ?act ?dt)
+        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch "none" ?act ?dt)
             (ICons ?a (ICons ?b (INil)))))
         (= ?add (Op (Add
             (ECons ?m (ECons ?n (ENil)))
@@ -86,7 +157,7 @@
         (= (dtype ?bias) ?dt)
     )
     (
-        (let ?fused (Op (MojoGemm ?m ?n ?k "bias" ?act ?dt)
+        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch "bias" ?act ?dt)
             (ICons ?a (ICons ?b (ICons ?bias (INil))))))
         (union ?add ?fused)
         (set (dtype ?fused) ?dt)
@@ -99,7 +170,7 @@
 
 (rule
     (
-        (= ?gemm (Op (MojoGemm ?m ?n ?k ?bias "none" ?dt)
+        (= ?gemm (Op (MojoGemm ?m ?n ?k ?batch ?bias "none" ?dt)
             (ICons ?a (ICons ?b ?gemm_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -129,7 +200,7 @@
         (= ?dt (dtype ?relu))
     )
     (
-        (let ?fused (Op (MojoGemm ?m ?n ?k ?bias "relu" ?dt)
+        (let ?fused (Op (MojoGemm ?m ?n ?k ?batch ?bias "relu" ?dt)
             (ICons ?a (ICons ?b ?gemm_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) ?dt)

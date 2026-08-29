@@ -50,7 +50,8 @@ pub enum StepKind {
     RustGather { indexes: NodeIndex, data: NodeIndex, out: NodeIndex, index_len: usize, data_len: usize, phys_map: Vec<usize> },
     /// Rust-side Scatter: out = copy of dest, then out[dest_phys[indexes[idx_phys[i]]]] = src[src_phys[i]]
     RustScatter { out: NodeIndex, dest: NodeIndex, indexes: NodeIndex, src: NodeIndex, dest_len: usize, index_len: usize, dest_phys: Vec<usize>, idx_phys: Vec<usize>, src_phys: Vec<usize> },
-    /// Fused GEMM: out[m,n] = relu(a[m,k] @ b[k,n] + bias[n])
+    /// Fused GEMM: out[b,m,n] = relu(a[b,m,k] @ b[b,k,n] + bias[n]); batch is
+    /// baked into the emitted kernel, so the FFI signature stays pointer-only
     Gemm { a: NodeIndex, b: NodeIndex, bias: Option<NodeIndex>, out: NodeIndex },
 }
 
@@ -209,15 +210,16 @@ pub fn generate_mojo(
                 let m = resolve_expr(&gemm.m, dyn_map);
                 let n = resolve_expr(&gemm.n, dyn_map);
                 let k = resolve_expr(&gemm.k, dyn_map);
+                let batch = resolve_expr(&gemm.batch, dyn_map);
                 let inputs: Vec<NodeIndex> = llir_graph
                     .edges_directed(node, Direction::Incoming)
                     .sorted_by_key(|e| e.id())
                     .map(|e| e.source())
                     .collect();
                 let bias = if gemm.bias { Some(inputs[2]) } else { None };
-                buffer_sizes.insert(node, m * n * 4);
+                buffer_sizes.insert(node, batch * m * n * 4);
                 let fn_name = format!("op_{step_idx}");
-                mojo_funcs.push(gen_gemm(&fn_name, m, n, k, gemm.bias, gemm.relu));
+                mojo_funcs.push(gen_gemm(&fn_name, batch, m, n, k, gemm.bias, gemm.relu));
                 exec_plan.push(ExecStep {
                     func_name: fn_name,
                     kind: StepKind::Gemm { a: inputs[0], b: inputs[1], bias, out: node },
@@ -670,8 +672,11 @@ def {fn_name}(
 /// `acc_var` is the accumulator name, `acc_init` is the Float32 init value,
 /// `acc_stmt` is the full accumulation statement (e.g. "acc += val" or "if val > best: best = val").
 /// `stride_exprs` are Mojo expressions for the base index into the input, parameterized by loop variables.
-/// Generate a fused GEMM kernel: out[m,n] = relu(a[m,k] @ b[k,n] + bias[n]).
-fn gen_gemm(fn_name: &str, m: usize, n: usize, k: usize, bias: bool, relu: bool) -> String {
+/// Generate a fused GEMM kernel: out[b,m,n] = relu(a[b,m,k] @ b[b,k,n] + bias[n]).
+/// Vectorized 8-wide along n (the only contiguous axis: b's rows and bias are
+/// contiguous in n) with a scalar tail for n % 8; `batch` is baked into the
+/// kernel body as an outermost loop, keeping the FFI signature pointer-only.
+fn gen_gemm(fn_name: &str, batch: usize, m: usize, n: usize, k: usize, bias: bool, relu: bool) -> String {
     let params = if bias {
         "a_ptr: OpaquePointer[MutUntrackedOrigin],\n    b_ptr: OpaquePointer[MutUntrackedOrigin],\n    bias_ptr: OpaquePointer[MutUntrackedOrigin],\n    out_ptr: OpaquePointer[MutUntrackedOrigin]"
     } else {
@@ -682,16 +687,46 @@ fn gen_gemm(fn_name: &str, m: usize, n: usize, k: usize, bias: bool, relu: bool)
     } else {
         ""
     };
-    let bias_line = if bias {
-        "            acc = acc + bias.unsafe_load(jn)\n"
+
+    let batched = batch > 1;
+    // Indentation levels: `row` = the im loop line, `loop2` = the while/for-jn
+    // lines (im-loop body), `vec_body` = their bodies + the ik loop lines +
+    // epilogue statements, `ik_body` = the accumulation statements.
+    let row = if batched { "        " } else { "    " };
+    let loop2 = if batched { "            " } else { "        " };
+    let vec_body = if batched { "                " } else { "            " };
+    let ik_body = if batched { "                    " } else { "                " };
+    let epi = vec_body;
+
+    let a_batch = if batched { format!("ib * {} + ", m * k) } else { String::new() };
+    let b_batch = if batched { format!("ib * {} + ", k * n) } else { String::new() };
+    let batch_open = if batched {
+        format!("    for ib in range({batch}):\n")
     } else {
-        ""
+        String::new()
     };
-    let relu_lines = if relu {
-        "            if acc < Float32(0):\n                acc = Float32(0)\n"
+
+    let bias_vec = if bias {
+        format!("{epi}acc8 = acc8 + bias.unsafe_load[width=8](jj)\n")
     } else {
-        ""
+        String::new()
     };
+    let relu_vec = if relu {
+        format!("{epi}acc8 = max(acc8, SIMD[DType.float32, 8](0))\n")
+    } else {
+        String::new()
+    };
+    let bias_scalar = if bias {
+        format!("{epi}acc = acc + bias.unsafe_load(jn)\n")
+    } else {
+        String::new()
+    };
+    let relu_scalar = if relu {
+        format!("{epi}if acc < Float32(0):\n{epi}    acc = Float32(0)\n")
+    } else {
+        String::new()
+    };
+
     format!(
         r##"@export("{fn_name}")
 def {fn_name}(
@@ -701,13 +736,21 @@ def {fn_name}(
     var b = b_ptr.unsafe_bitcast[Scalar[DType.float32]]()
 {bias_cast}    var out = out_ptr.unsafe_bitcast[Scalar[DType.float32]]()
     var out_pos = 0
-    for im in range({m}):
-        for jn in range({n}):
-            var acc = Float32(0)
-            for ik in range({k}):
-                acc = acc + a.unsafe_load(im * {k} + ik) * b.unsafe_load(ik * {n} + jn)
-{bias_line}{relu_lines}            out.unsafe_store(out_pos, acc)
-            out_pos += 1"##
+{batch_open}{row}for im in range({m}):
+{loop2}var jj = 0
+{loop2}while jj + 8 <= {n}:
+{vec_body}var acc8 = SIMD[DType.float32, 8](0)
+{vec_body}for ik in range({k}):
+{ik_body}acc8 = acc8 + SIMD[DType.float32, 8](a.unsafe_load({a_batch}im * {k} + ik)) * b.unsafe_load[width=8]({b_batch}ik * {n} + jj)
+{bias_vec}{relu_vec}{vec_body}out.unsafe_store[width=8](out_pos, acc8)
+{vec_body}out_pos += 8
+{vec_body}jj += 8
+{loop2}for jn in range(jj, {n}):
+{vec_body}var acc = Float32(0)
+{vec_body}for ik in range({k}):
+{ik_body}acc = acc + a.unsafe_load({a_batch}im * {k} + ik) * b.unsafe_load({b_batch}ik * {n} + jn)
+{bias_scalar}{relu_scalar}{vec_body}out.unsafe_store(out_pos, acc)
+{vec_body}out_pos += 1"##
     )
 }
 

@@ -24,6 +24,7 @@ pub struct MojoGemmLLIR {
     pub m: Expression,
     pub n: Expression,
     pub k: Expression,
+    pub batch: Expression,
     pub bias: bool,
     pub relu: bool,
     pub dtype: DType,
@@ -49,6 +50,7 @@ impl EgglogOp for MojoGemm {
                 ("m", EXPRESSION),
                 ("n", EXPRESSION),
                 ("k", EXPRESSION),
+                ("batch", EXPRESSION),
                 ("bias", STRING),
                 ("act", STRING),
                 ("dtype", DTYPE),
@@ -85,14 +87,16 @@ impl EgglogOp for MojoGemm {
         let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
         let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
         let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-        let bias = egraph.enodes[kind_children[3]].0.trim_matches('"') == "bias";
-        let relu = egraph.enodes[kind_children[4]].0.trim_matches('"') == "relu";
-        let dtype = extract_dtype(egraph, kind_children[5]);
+        let batch = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let bias = egraph.enodes[kind_children[4]].0.trim_matches('"') == "bias";
+        let relu = egraph.enodes[kind_children[5]].0.trim_matches('"') == "relu";
+        let dtype = extract_dtype(egraph, kind_children[6]);
 
         let extracted = MojoGemmLLIR {
             m,
             n,
             k,
+            batch,
             bias,
             relu,
             dtype,
@@ -103,3 +107,4 @@ impl EgglogOp for MojoGemm {
         )
     }
 }
+

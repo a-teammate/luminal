@@ -348,3 +348,25 @@ fn gemm_bias_relu_matches_reference() {
         "gemm_bias_relu",
     );
 }
+
+#[test]
+fn gemm_batched_matches_reference() {
+    // Batched 3D matmul: out[b,m,n] = a[b,m,k] @ b[b,k,n] — the 3D base rule
+    // should fuse this into a single batched MojoGemm kernel.
+    assert_matches_reference(
+        |cx: &mut Graph| {
+            let a = cx.tensor((2, 4, 8));
+            let b = cx.tensor((2, 8, 3));
+            let out = a.matmul(b).output();
+            (
+                vec![
+                    (a.id, gen_data(64, 1.0)),
+                    (b.id, gen_data(48, 2.0)),
+                ],
+                out.id,
+            )
+        },
+        1e-4,
+        "gemm_batched",
+    );
+}
