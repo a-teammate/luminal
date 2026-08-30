@@ -6,18 +6,24 @@ use luminal::{
 };
 use luminal_nn::LayerNorm;
 
-// Qwen3-4B hyperparams
-pub const LAYERS: usize = 36;
-pub const HIDDEN: usize = 2560;
-pub const INTERMEDIATE: usize = 9728;
+// Qwen3-0.6B hyperparams
+pub const LAYERS: usize = 28;
+pub const HIDDEN: usize = 1024;
+pub const INTERMEDIATE: usize = 3072;
 pub const HEAD_DIM: usize = 128;
-pub const N_HEADS: usize = 32;
+pub const N_HEADS: usize = 16;
 pub const N_KV_HEADS: usize = 8;
-pub const KV_GROUPS: usize = N_HEADS / N_KV_HEADS; // = 4
-pub const Q_DIM: usize = N_HEADS * HEAD_DIM; // = 4096
+pub const KV_GROUPS: usize = N_HEADS / N_KV_HEADS; // = 2
+pub const Q_DIM: usize = N_HEADS * HEAD_DIM; // = 2048
 pub const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // = 1024
 pub const VOCAB_SIZE: usize = 151936;
 pub const RMS_NORM_EPS: f32 = 1e-6;
+
+/// Weight/cache dtype for the whole pipeline. The combined HF file stores
+/// bf16 (norms f32); backends that run the graph in f32 (reference CPU,
+/// luminal_mojo) need this at F32 — the loader upconverts at load time.
+pub const MODEL_DTYPE: DType = DType::F32;
+pub const MODEL_DTYPE_SIZE: usize = 4;
 
 pub struct KVCache {
     pub k_caches: Vec<GraphTensor>,
@@ -42,7 +48,7 @@ impl KVCache {
                     format!("kv_cache.{l}.k"),
                     (N_KV_HEADS, max_seq, HEAD_DIM),
                 )
-                .as_dtype(DType::Bf16),
+                .as_dtype(MODEL_DTYPE),
             );
             v_caches.push(
                 persist(
@@ -50,7 +56,7 @@ impl KVCache {
                     format!("kv_cache.{l}.v"),
                     (N_KV_HEADS, max_seq, HEAD_DIM),
                 )
-                .as_dtype(DType::Bf16),
+                .as_dtype(MODEL_DTYPE),
             );
         }
         Self {
@@ -75,7 +81,7 @@ impl Qwen {
         );
         Self {
             embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-                .as_dtype(DType::Bf16),
+                .as_dtype(MODEL_DTYPE),
             layers: (0..layers).map(|l| QwenLayer::init(cx, l)).collect(),
             lm_norm: rms_norm(cx, "model.norm.weight"),
         }
@@ -104,8 +110,21 @@ impl Qwen {
         // Tied embeddings: lm_head = embedding.t(). Norm computes in F32; the
         // logits are cast to F32 at the head so the host get_f32 + argmax
         // sampling path is unchanged.
+        //
+        // The head runs only on the LAST sequence row (the only one the
+        // sampler reads): a position-indicator matmul-free gather keeps the
+        // naive broadcast-mul reference implementation at [1, H, V] instead
+        // of [s, H, V].
         let normed = norm_in_f32(&self.lm_norm, x);
-        let mut logits = normed.matmul(self.embedding.t());
+        let cx = normed.graph();
+        let prev = Expression::from('p');
+        let seq_expr = Expression::from('s');
+        let seq = *normed.shape.dims.first().unwrap();
+        let positions = cx.arange(seq).cast(DType::F32) + prev;
+        let last_pos = (cx.arange(seq) * 0).cast(DType::F32) + prev + seq_expr - 1.0;
+        let last_row_indicator = positions.ge(last_pos).cast(DType::F32);
+        let last_hidden = (normed * last_row_indicator.expand_dim(1, HIDDEN)).sum(0);
+        let mut logits = last_hidden.matmul(self.embedding.t());
         if logits.dtype != DType::F32 {
             logits = logits.cast(DType::F32);
         }
@@ -130,15 +149,15 @@ struct QwenLayer {
 impl QwenLayer {
     fn init(cx: &mut Graph, l: usize) -> Self {
         Self {
-            up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)).as_dtype(DType::Bf16),
+            up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)).as_dtype(MODEL_DTYPE),
             gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN))
-                .as_dtype(DType::Bf16),
+                .as_dtype(MODEL_DTYPE),
             down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE))
-                .as_dtype(DType::Bf16),
-            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)).as_dtype(DType::Bf16),
-            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),
-            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),
-            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)).as_dtype(DType::Bf16),
+                .as_dtype(MODEL_DTYPE),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)).as_dtype(MODEL_DTYPE),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)).as_dtype(MODEL_DTYPE),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)).as_dtype(MODEL_DTYPE),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)).as_dtype(MODEL_DTYPE),
             q_norm: layer_weight(cx, l, "self_attn.q_norm", HEAD_DIM),
             k_norm: layer_weight(cx, l, "self_attn.k_norm", HEAD_DIM),
             attn_rms: rms_norm(cx, format!("model.layers.{l}.input_layernorm.weight")),

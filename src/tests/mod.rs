@@ -4,7 +4,8 @@ use crate::egglog_utils::{
     extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
 };
 use crate::hlir::{
-    Add as ReferenceAdd, LessThan as ReferenceLessThan, Output, ReferenceData, ReferenceOp,
+    Add as ReferenceAdd, Input, LessThan as ReferenceLessThan, Output, ReferenceData,
+    ReferenceOp,
 };
 use crate::prelude::*;
 use candle_core::{Device, Tensor};
@@ -461,11 +462,10 @@ fn reference_less_than_rejects_mixed_dtypes() {
 }
 
 #[test]
-#[should_panic]
-fn test_inputs_consumed_after_execute() {
+fn test_inputs_persist_across_executes() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
-    let _b = (a * 2.0).output();
+    let b = (a * 2.0).output();
     cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let mut rt = cx.search(
         ReferenceRuntime::default(),
@@ -473,8 +473,9 @@ fn test_inputs_consumed_after_execute() {
     );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
-    // Second execute should panic — input 'a' was consumed
+    // Inputs are set-once: a second execute works without re-feeding.
     rt.execute(&cx.dyn_map);
+    assert_close(rt.get_f32(b.id), &[2.0, 4.0, 6.0]);
 }
 
 #[test]
@@ -506,7 +507,7 @@ fn test_passthrough_preserves_weights() {
 }
 
 #[test]
-fn test_only_outputs_remain() {
+fn test_only_outputs_and_inputs_remain() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
     let _b = (a * 2.0).output();
@@ -517,12 +518,17 @@ fn test_only_outputs_remain() {
     );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
-    let output_count = rt
+    // Intermediates are freed as they are consumed; Input and Output
+        // buffers persist across executes.
+    let persistent = rt
         .graph
         .node_indices()
-        .filter(|n| (**rt.graph[*n]).as_any().is::<Output>())
+        .filter(|n| {
+            (**rt.graph[*n]).as_any().is::<Output>()
+                || (**rt.graph[*n]).as_any().is::<Input>()
+        })
         .count();
-    assert_eq!(rt.buffers.len(), output_count);
+    assert_eq!(rt.buffers.len(), persistent);
 }
 
 fn build_repeated_block_graph(

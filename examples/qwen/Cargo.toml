@@ -12,6 +12,7 @@ default = []
 cuda = ["dep:luminal_cuda_lite"]
 metal = ["dep:luminal_metal"]
 mojo = ["dep:luminal_mojo"]
+reference = []
 
 [dependencies]
 luminal = { path = "../.." }
@@ -34,3 +35,4 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 rustc-hash = "2.1"
+rand = "0.9"

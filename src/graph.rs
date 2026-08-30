@@ -1685,6 +1685,13 @@ impl Graph {
         self.search_space.as_ref()
     }
 
+    /// Release the saturated e-graphs after compilation. Runtimes copy what
+    /// they need during `compile`, so this is safe once searching is done and
+    /// frees GBs for large models (one e-graph per bucket combination).
+    pub fn drop_search_space(&mut self) {
+        self.search_space = None;
+    }
+
     /// Get a reference to the first e-graph search space (if built)
     pub fn egraph(&self) -> Option<&SerializedEGraph> {
         self.search_space

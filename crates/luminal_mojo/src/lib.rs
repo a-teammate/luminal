@@ -111,17 +111,21 @@ impl MojoRuntime {
         self.dirty.insert(id);
     }
 
-    /// Remove and return a buffer (for KV cache promote: output → caller).
+    /// Return a copy of a buffer (for KV cache promote: output → caller).
+    /// The arena keeps the buffer: the exec plan re-reads and re-writes these
+    /// nodes on every execute, so they must stay resident.
     pub fn remove_buffer(&mut self, id: NodeIndex) -> Vec<u8> {
         // Try active bucket's output_map first, then input_map
         let llir_node = self.buckets.get(self.active_bucket)
             .and_then(|b| b.output_map.get(&id).or_else(|| b.input_map.get(&id)))
             .copied();
         if let Some(llir) = llir_node {
-            self.data_len[self.active_bucket].remove(&llir);
-            self.buffers[self.active_bucket].remove(&llir).unwrap_or_default()
+            self.buffers[self.active_bucket]
+                .get(&llir)
+                .cloned()
+                .unwrap_or_default()
         } else {
-            self.hlir_data.remove(&id).unwrap_or_default()
+            self.hlir_data.get(&id).cloned().unwrap_or_default()
         }
     }
 
@@ -323,6 +327,18 @@ impl MojoRuntime {
 
         self.active_bucket = new_bucket;
         self.allocate_bucket_buffers();
+
+        // Two-arena LRU: every bucket duplicates the weight inputs at
+        // allocate time, so with per-step point buckets the arenas would
+        // accumulate a full weight copy per decode step. Keep only the
+        // previous and current arenas; re-entering a freed bucket re-copies
+        // from hlir_data.
+        for idx in 0..self.buckets.len() {
+            if idx != new_bucket && idx != old {
+                self.buffers[idx].clear();
+                self.data_len[idx].clear();
+            }
+        }
     }
 
     /// Allocate buffers for the active bucket from buffer_sizes + hlir_data.
@@ -498,7 +514,14 @@ fn execute_step(
             let len = data_len.get(src).copied().unwrap_or(src_buf.len() / 4);
             data_len.insert(*dst, len);
             let copy_bytes = (len * 4).min(src_buf.len());
-            let dst_buf = buffers.get_mut(dst).unwrap();
+            let dst_buf = buffers.get_mut(dst);
+            let dst_buf = match dst_buf {
+                Some(b) => b,
+                None => panic!(
+                    "Copy dst {dst:?} missing from arena (src {src:?}, have {} buffers)",
+                    buffers.len()
+                ),
+            };
             let n = copy_bytes.min(dst_buf.len());
             dst_buf[..n].copy_from_slice(&src_buf[..n]);
         }
@@ -661,13 +684,27 @@ impl Runtime for MojoRuntime {
         // per-execute plan clone. The arena is NOT trimmed after execution:
         // buffers stay resident for the next execute/bucket re-entry.
         let active = self.active_bucket;
-        for step in &self.buckets[active].exec_plan {
+        let plan = self.buckets[active].exec_plan.clone();
+        let bucket = &self.buckets[active];
+        for (step_idx, step) in plan.iter().enumerate() {
             execute_step(
                 step,
-                &self.buckets[active].lib,
+                &bucket.lib,
                 &mut self.buffers[active],
                 &mut self.data_len[active],
             );
+            if let StepKind::Copy { dst, .. } = &step.kind {
+                if !self.buffers[active].contains_key(dst) {
+                    let b = &self.buckets[active];
+                    panic!(
+                        "[debug] step #{step_idx} Copy dst {dst:?} missing: in buffer_sizes={} in input_nodes={} in input_map={} plan_len={}",
+                        b.buffer_sizes.contains_key(dst),
+                        b.input_nodes.contains(dst),
+                        b.input_map.values().any(|v| v == dst),
+                        b.exec_plan.len()
+                    );
+                }
+            }
         }
     }
 

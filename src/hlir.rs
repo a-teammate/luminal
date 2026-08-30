@@ -2372,60 +2372,82 @@ impl ReferenceOp for Gather {
     fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (indexes, data) = (inputs[0], inputs[1]);
         let indexes_ind = StridedIterator::new(&self.index_shape, &self.index_strides, dyn_map);
-        let data_ind =
-            StridedIterator::new(&self.data_shape, &self.data_strides, dyn_map).collect_vec();
+        let data_shape: Vec<usize> = self
+            .data_shape
+            .iter()
+            .map(|e| e.exec(dyn_map).unwrap())
+            .collect();
+        let data_strides: Vec<Expression> = self
+            .data_strides
+            .iter()
+            .copied()
+            .map(|e| e.resolve_vars(dyn_map))
+            .collect();
+        // Translate a flat data index to its strided offset on demand;
+        // materializing every offset costs O(data.len()) memory and dominates
+        // embedding-sized gathers.
+        let data_offset = |flat: usize| -> usize {
+            let mut offset = 0;
+            let mut rem = flat;
+            for d in (0..data_shape.len()).rev() {
+                let size = data_shape[d].max(1);
+                offset += data_strides[d].exec_single_var(rem % size);
+                rem /= size;
+            }
+            offset
+        };
         let ReferenceData::Int(indexes) = indexes else {
             panic!("indexes must be int!")
         };
         match data {
             ReferenceData::F32(a) => ReferenceData::F32(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::F16(a) => ReferenceData::F16(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::Bf16(a) => ReferenceData::Bf16(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::Int(a) => ReferenceData::Int(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::I64(a) => ReferenceData::I64(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::I8(a) => ReferenceData::I8(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::U8(a) => ReferenceData::U8(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::I16(a) => ReferenceData::I16(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::F64(a) => ReferenceData::F64(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
             ReferenceData::Bool(a) => ReferenceData::Bool(
                 indexes_ind
-                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .map(|i| a[data_offset(indexes[i] as usize)])
                     .collect(),
             ),
         }
@@ -3257,6 +3279,19 @@ impl Runtime for ReferenceRuntime {
     }
 
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
+        // Free each intermediate as soon as all its consumers have executed:
+        // peak memory becomes the max live set instead of the sum of every
+        // node buffer (embedding-sized gathers and broadcast matmul muls make
+        // the sum prohibitive for real models). Output-node consumers
+        // decrement in the Output branch after their clone.
+        let mut remaining_consumers: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        for node in self.graph.node_indices() {
+            let consumers = self.graph.edges_directed(node, Direction::Outgoing).count();
+            if consumers > 0 {
+                remaining_consumers.insert(node, consumers);
+            }
+        }
+
         for node in toposort(&self.graph, None).unwrap() {
             if (**self.graph[node]).as_any().is::<Input>() {
                 continue;
@@ -3271,8 +3306,14 @@ impl Runtime for ReferenceRuntime {
                     .next()
                     .unwrap()
                     .source();
-                let data = self.buffers[&source].clone();
+                let data = self.buffers.get(&source).unwrap_or_else(|| {
+                    panic!(
+                        "Output {node:?} source {source:?} ({:?}) buffer missing",
+                        &**self.graph[source]
+                    )
+                }).clone();
                 self.buffers.insert(node, data);
+                self.release_consumed(source, &mut remaining_consumers);
                 continue;
             }
 
@@ -3286,6 +3327,15 @@ impl Runtime for ReferenceRuntime {
                 .collect_vec();
             let output = self.graph[node].execute(inputs, dyn_map);
             self.buffers.insert(node, output);
+            for pred in self
+                .graph
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|e| e.id())
+                .map(|e| e.source())
+                .collect_vec()
+            {
+                self.release_consumed(pred, &mut remaining_consumers);
+            }
         }
 
         // Consume all non-Output buffers (inputs + intermediates)
@@ -3294,7 +3344,34 @@ impl Runtime for ReferenceRuntime {
             .node_indices()
             .filter(|n| (**self.graph[*n]).as_any().is::<Output>())
             .collect();
-        self.buffers.retain(|k, _| output_nodes.contains(k));
+        // Input buffers persist across executes: set-once semantics match the
+        // other runtimes, and Output passthroughs re-read their source Input
+        // on every execute.
+        self.buffers
+            .retain(|k, _| output_nodes.contains(k) || (**self.graph[*k]).as_any().is::<Input>());
+    }
+}
+
+impl ReferenceRuntime {
+    /// Drop a node's buffer once every consumer has read it. Output nodes
+    /// persist across executes and are never released here.
+    fn release_consumed(
+        &mut self,
+        node: NodeIndex,
+        remaining_consumers: &mut FxHashMap<NodeIndex, usize>,
+    ) {
+        if (**self.graph[node]).as_any().is::<Output>()
+            || (**self.graph[node]).as_any().is::<Input>()
+        {
+            return;
+        }
+        if let Some(remaining) = remaining_consumers.get_mut(&node) {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                remaining_consumers.remove(&node);
+                self.buffers.remove(&node);
+            }
+        }
     }
 }
 
